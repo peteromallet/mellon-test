@@ -1,0 +1,266 @@
+:root {
+  --category-default: 59, 63, 70;
+  --category-image: 21, 95, 160;
+  --category-utility: 139, 195, 74;
+  --category-text-encoder: 228, 168, 15;
+  --category-vae: 86, 38, 118;
+  --category-samplers: 186, 21, 81;
+  --category-loaders: 12, 139, 71;
+  --test: rgb(86, 38, 118);
+}
+
+.react-flow__handle {
+  background-color: rgb(100, 100, 100);
+  width: 12px;
+  height: 9px;
+  border-radius: 1px;
+  outline: 4px solid #121212;
+}
+
+/*
+ * Handle clickable area
+ */
+.react-flow__handle::before {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 24px;
+  height: 24px;
+  cursor: crosshair;
+}
+
+.react-flow__handle-left {
+  left: -9px;
+}
+
+.react-flow__handle-right {
+  right: -9px;
+}
+
+.react-flow__node-custom {
+  border-radius: 0;
+}
+
+.mellon-disabled {
+  pointer-events: none !important;
+  opacity: 0.35 !important;
+}
+
+.mellon-hidden {
+  display: none !important;
+}
+
+/* 
+@keyframes mellon-progress-ind {
+  0% { left:-35%; right:98%; }
+  100% { left:98%; right:-35%; }
+}
+@-webkit-keyframes mellon-progress-ind {
+  0% { left:-35%; right:100%; }
+  100% { left:100%; right:-35%; }
+} */
+
+
+@keyframes mellon-progress-ind {
+  0% { background-position: 0% 0%; }
+  100% { background-position: -60px 0%; }
+}
+@-webkit-keyframes mellon-progress-ind {
+  0% { background-position: 0% 0%; }
+  100% { background-position: -60px 0%; }
+}
+
+
+/*
+ * Category Colors
+ * ----------------------------------------------------------------------------
+ */
+
+/* Left sidebar */
+
+.left-sidebar .MuiListItem-root,
+.left-sidebar .category-default {
+  border-color: rgb(var(--category-default));
+}
+
+.left-sidebar .category-default:hover {
+  background-color: rgba(var(--category-default), 0.25);
+}
+
+.left-sidebar .category-image {
+  border-color: rgb(var(--category-image));
+  outline: 1px solid rgba(var(--category-image), 0.66);
+}
+
+.left-sidebar .category-image:hover {
+  background-color: rgba(var(--category-image), 0.25);
+}
+
+.left-sidebar .category-text-encoders,
+.left-sidebar .category-t5,
+.left-sidebar .category-clip {
+  border-color: rgb(var(--category-text-encoder));
+}
+
+.left-sidebar .category-text-encoders:hover,
+.left-sidebar .category-t5:hover,
+.left-sidebar .category-clip:hover {
+  background-color: rgba(var(--category-text-encoder), 0.25);
+}
+
+.left-sidebar .category-utility {
+  border-color: rgb(var(--category-utility));
+}
+
+.left-sidebar .category-utility:hover {
+  background-color: rgba(var(--category-utility), 0.25);
+}
+
+.left-sidebar .category-vae {
+  border-color: rgb(var(--category-vae));
+}
+
+.left-sidebar .category-vae:hover {
+  background-color: rgba(var(--category-vae), 0.25);
+}
+
+.left-sidebar .category-samplers {
+  border-color: rgb(var(--category-samplers));
+}
+
+.left-sidebar .category-samplers:hover {
+  background-color: rgba(var(--category-samplers), 0.25);
+}
+
+.left-sidebar .category-loaders {
+  border-color: rgb(var(--category-loaders));
+}
+
+.left-sidebar .category-loaders:hover {
+  background-color: rgba(var(--category-loaders), 0.25);
+}
+
+/* Node header */
+
+
+.react-flow__node-custom header,
+.react-flow__node-custom .category-default header {
+  border-color: rgb(var(--category-default));
+}
+
+.react-flow__node-custom .category-image header {
+  border-color: rgb(var(--category-image));
+}
+
+.react-flow__node-custom .category-text-encoders header,
+.react-flow__node-custom .category-t5 header,
+.react-flow__node-custom .category-clip header {
+  border-color: rgb(var(--category-text-encoder));
+}
+
+.react-flow__node-custom .category-utility header {
+  border-color: rgb(var(--category-utility));
+}
+
+.react-flow__node-custom .category-vae header {
+  border-color: rgb(var(--category-vae));
+}
+
+.react-flow__node-custom .category-samplers header {
+  border-color: rgb(var(--category-samplers));
+}
+
+.react-flow__node-custom .category-loaders header {
+  border-color: rgb(var(--category-loaders));
+}
+
+/* Node selection */
+
+.react-flow__node-custom.selected > .MuiBox-root,
+.react-flow__node-custom.selected > .category-default {
+  outline: 2px solid rgba(var(--category-default), 0.66);
+}
+
+.react-flow__node-custom.selected > .category-image {
+  outline: 2px solid rgba(var(--category-image), 0.66);
+}
+
+.react-flow__node-custom.selected > .category-text-encoders,
+.react-flow__node-custom.selected > .category-t5,
+.react-flow__node-custom.selected > .category-clip {
+  outline: 2px solid rgba(var(--category-text-encoder), 0.66);
+}
+
+.react-flow__node-custom.selected > .category-utility {
+  outline: 2px solid rgba(var(--category-utility), 0.66);
+}
+
+.react-flow__node-custom.selected > .category-vae {
+  outline: 2px solid rgba(var(--category-vae), 0.66);
+}
+
+.react-flow__node-custom.selected > .category-samplers {
+  outline: 2px solid rgba(var(--category-samplers), 0.66);
+}
+
+.react-flow__node-custom.selected > .category-loaders {
+  outline: 2px solid rgba(var(--category-loaders), 0.66);
+}
+
+/* Node handles */
+
+.react-flow__node-custom .default-handle {
+  background-color: rgb(var(--category-default));
+}
+
+.react-flow__node-custom .latent-handle,
+.react-flow__node-custom .image-handle {
+  background-color: rgb(var(--category-image));
+}
+
+.react-flow__node-custom .sdxlembeddings-handle,
+.react-flow__node-custom .sd3embeddings-handle,
+.react-flow__node-custom .embeddings-handle,
+.react-flow__node-custom .sd3textencoders-handle,
+.react-flow__node-custom .t5encoders-handle,
+.react-flow__node-custom .cliptextencoders-handle {
+  background-color: rgb(var(--category-text-encoder));
+}
+
+.react-flow__node-custom .utility-handle {
+  background-color: rgb(var(--category-utility));
+}
+
+.react-flow__node-custom .vae-handle {
+  background-color: rgb(var(--category-vae));
+}
+
+.react-flow__node-custom .sdxlpipeline-handle,
+.react-flow__node-custom .sd3pipeline-handle,
+.react-flow__node-custom .pipeline-handle,
+.react-flow__node-custom .sd3transformer2dmodel-handle,
+.react-flow__node-custom .samplers-handle {
+  background-color: rgb(var(--category-samplers));
+}
+
+.react-flow__handle.valid {
+  outline-color: rgba(16, 182, 13, 1);
+  /*background: #10b60d;*/
+}
+
+.react-flow__connection-path {
+  stroke: #aaaaaa;
+  stroke-width: 3;
+  stroke-dasharray: 8,8;
+}
+
+.react-flow__edge .react-flow__edge-path {
+  stroke-width: 3;
+  stroke-opacity: 0.7;
+}
+
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke-opacity: 1;
+}

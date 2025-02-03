@@ -1,0 +1,11 @@
+# for quantization
+optimum-quanto
+bitsandbytes
+--extra-index-url https://download.pytorch.org/whl/cu124
+torchao
+
+# for clean caption
+beautifulsoup4
+
+# generic graphics
+opencv-python
