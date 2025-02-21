@@ -15,6 +15,10 @@ from copy import deepcopy
 import random
 import signal
 import time
+import os
+import gc
+from pathlib import Path
+import tempfile
 
 def are_different(old_output, new_output):
     """Compare two outputs to determine if they are different."""
@@ -31,7 +35,14 @@ def are_different(old_output, new_output):
     return old_output != new_output
 
 class WebServer:
-    def __init__(self, module_map: dict, host: str = "0.0.0.0", port: int = 8080, cors: bool = False, cors_route: str = "*"):
+    def __init__(
+        self, 
+        module_map: dict, 
+        host: str = "0.0.0.0", 
+        port: int = 8080, 
+        cors: bool = False, 
+        cors_route: str = "*"
+    ):
         self.module_map = module_map
         self.node_store = {}
         self.queue = asyncio.Queue()
@@ -45,17 +56,24 @@ class WebServer:
         self.client_queue = asyncio.Queue()
         self.client_task = None
 
-        self.app.add_routes([web.get('/', self.index),
-                             web.get('/nodes', self.nodes),
-                             web.get('/view/{format}/{node}/{key}/{index}', self.view),
-                             web.get('/custom_component/{module}/{component}', self.custom_component),
-                             web.get('/custom_assets/{module}/{file_path}', self.custom_assets),
-                             web.post('/graph', self.graph),
-                             web.post('/nodeExecute', self.node_execute),                             
-                             web.delete('/clearNodeCache', self.clear_node_cache),
-                             web.static('/assets', 'web/assets'),
-                             web.get('/favicon.ico', self.favicon),
-                             web.get('/ws', self.websocket_handler)])
+        self.app.add_routes([
+            web.get('/', self.index),
+            web.get('/nodes', self.nodes),
+            web.get('/view/{format}/{node}/{key}/{index}', self.view),
+            web.get('/view/{format}/{node}/{key}', self.view),
+            web.get('/custom_component/{module}/{component}', self.custom_component),
+            web.get('/custom_assets/{module}/{file_path}', self.custom_assets),
+            web.get('/files', self.list_files),
+            web.post('/data/files', self.upload_file),
+            web.get('/data/files/{filename}', self.get_file),
+            web.delete('/data/files/{filename}', self.delete_file),
+            web.post('/graph', self.graph),
+            web.post('/nodeExecute', self.node_execute),
+            web.delete('/clearNodeCache', self.clear_node_cache),
+            web.static('/assets', 'web/assets'),
+            web.get('/favicon.ico', self.favicon),
+            web.get('/ws', self.websocket_handler)
+        ])
 
         if cors:
             cors = cors_setup(self.app, defaults={
@@ -65,7 +83,6 @@ class WebServer:
                     allow_headers="*",
                 )
             })
-
             for route in list(self.app.router.routes()):
                 cors.add(route)
 
@@ -83,11 +100,7 @@ class WebServer:
             for task in tasks:
                 task.cancel()
 
-            #try:
-                # Wait for all tasks to finish
             await asyncio.gather(*tasks, return_exceptions=True)
-            #except asyncio.CancelledError:
-                #pass  # Ignore cancelled error during shutdown
 
             # Close all websocket connections
             for ws in list(self.ws_clients.values()):
@@ -133,10 +146,9 @@ class WebServer:
         try:
             asyncio.run(start_app())
         except KeyboardInterrupt:
-            # On Windows, asyncio.run() may not handle KeyboardInterrupt properly
             pass
         except asyncio.CancelledError:
-            pass  # Ignore cancelled error during shutdown
+            pass
 
     async def process_client_messages(self):
         while True:
@@ -189,9 +201,6 @@ class WebServer:
             module = path[0]
             component = path[1]
 
-        #if module not in self.module_map:
-        #    raise web.HTTPNotFound(text=f"Module {module} not found")
-
         response = web.FileResponse(f'custom/{module}/web/{component}.js')
         response.headers["Content-Type"] = "application/javascript"
         response.headers["Cache-Control"] = "no-cache"
@@ -202,13 +211,10 @@ class WebServer:
     async def custom_assets(self, request):
         module = request.match_info.get('module')
         file_path = request.match_info.get('file_path')
-
-        #if module not in self.module_map:
-        #    raise web.HTTPNotFound(text=f"Module {module} not found")
-
         return web.FileResponse(f'custom/{module}/web/assets/{file_path}')
 
     async def nodes(self, request):
+        from copy import deepcopy
         nodes = {}
         for module_name, actions in self.module_map.items():
             for action_name, action in actions.items():
@@ -216,9 +222,7 @@ class WebServer:
                 groups = {}
                 if 'params' in action:
                     params = deepcopy(action['params'])
-
                     for p in params:
-                        # remove attributes that are not needed by the client
                         if 'postProcess' in params[p]:
                             del params[p]['postProcess']
 
@@ -235,6 +239,8 @@ class WebServer:
                     nodes[f"{module_name}-{action_name}"]["style"] = action['style']
                 if 'resizable' in action:
                     nodes[f"{module_name}-{action_name}"]["resizable"] = action['resizable']
+                if 'type' in action:
+                    nodes[f"{module_name}-{action_name}"]["type"] = action['type']
 
         return web.json_response(nodes)
     
@@ -279,8 +285,7 @@ class WebServer:
             height = int(value.height * scale)
             value = value.resize((max(width, 1), max(height, 1)), resample=Resampling.BICUBIC)
 
-        # return the value as image
-        if format == "webp" or format == "png" or format == "jpeg":
+        if format in ["webp","png","jpeg"]:
             byte_arr = io.BytesIO()
             value.save(byte_arr, format=format.upper(), quality=quality)
             byte_arr = byte_arr.getvalue()
@@ -318,10 +323,10 @@ class WebServer:
         else:
             nodeId = list(self.node_store.keys())
 
-        for node in nodeId:
-            if node in self.node_store:
-                self.node_store[node] = None
-                del self.node_store[node]
+        for n in nodeId:
+            if n in self.node_store:
+                self.node_store[n] = None
+                del self.node_store[n]
 
         memory_flush(gc_collect=True)
 
@@ -393,59 +398,73 @@ class WebServer:
         sid = graph["sid"]
         nodes = graph["nodes"]
         paths = graph["paths"]
+        
+        print(f"\n=== Starting graph execution with SID: {sid} ===")
+        print(f"Number of nodes: {len(nodes)}")
+        print(f"Number of paths: {len(paths)}")
 
         randomized_fields = {}
-        for path in paths:
+        for path_index, path in enumerate(paths):
+            print(f"\n--- Processing path {path_index + 1}/{len(paths)} ---")
             for node in path:
                 module_name = nodes[node]["module"]
                 action_name = nodes[node]["action"]
+                print(f"\nExecuting node: {node}")
+                print(f"Module: {module_name}, Action: {action_name}")
                 logger.debug(f"Executing node {module_name}.{action_name}")
 
-                # Store old output for comparison
                 old_output = deepcopy(self.node_store[node].output) if node in self.node_store else None
+                print(f"Previous output exists: {old_output is not None}")
 
                 params = nodes[node]["params"]
+                print(f"Parameters: {params}")
                 ui_fields = {}
                 args = {}
                 for p in params:
                     source_id = params[p].get("sourceId")
                     source_key = params[p].get("sourceKey")
+                    print(f"\nProcessing parameter: {p}")
+                    print(f"Source ID: {source_id}, Source Key: {source_key}")
 
-                    if "display" in params[p] and params[p]["display"] == "ui":
-                        # store ui fields that need to be sent back to the client
-                        if params[p]["type"] == "image" or params[p]["type"] == "3d" or params[p]["type"] == "text":
+                    # Adjusted logic to handle "ui_video" or "ui"
+                    if ("display" in params[p] and params[p]["display"] in ("ui", "ui_video")) or p.startswith("ui_"):
+                        print(f"UI field detected: {p} with type {params[p]['type']}")
+                        if params[p]["type"] in ("image", "3d", "text", "video"):
                             ui_fields[p] = { "source": source_key, "type": params[p]["type"] }
                     else:
-                        # handle list values (spawn input fields)
-                        # if p ends with [d+], it means that the field is part of a list
                         if source_id and re.match(r".*\[\d+\]$", p):
+                            print(f"List field detected: {p}")
                             spawn_key = re.sub(r"\[\d+\]$", "", p)
                             if not args.get(spawn_key):
                                 args[spawn_key] = []
                             elif not isinstance(args[spawn_key], list):
                                 args[spawn_key] = [args[spawn_key]]
-
                             args[spawn_key].append(self.node_store[source_id].output[source_key])
                         else:
-                            # if there is a source id, it means that the value comes from a pipeline,
-                            # so we follow the connection to the source node and get the associated value
-                            # Otherwise we use the value in the params
-                            args[p] = self.node_store[source_id].output[source_key] if source_id else params[p].get("value")
+                            args[p] = (
+                                self.node_store[source_id].output[source_key]
+                                if source_id
+                                else params[p].get("value")
+                            )
+                            print(f"Regular field: {p} = {args[p]}")
 
-                # check if there is a field with the name __random__<param>
-                # randomize the field unless it has been already randomized
+                print(f"\nFinal arguments for node execution: {args}")
+                print(f"UI fields to update: {ui_fields}")
+
+                # Randomization
                 for key in args:
                     if key.startswith('__random__') and args[key] is True:
+                        print(f"\nRandomizing field: {key}")
                         if node not in randomized_fields:
                             randomized_fields[node] = []
                         if key in randomized_fields[node]:
+                            print(f"Field {key} already randomized, skipping")
                             continue
                         randomized_fields[node].append(key)
-
                         random_field = key.split('__random__')[1]
-                        args[random_field] = random.randint(0, (1<<53)-1) # TODO: allow min/max values
-                        #self.node_store[node].params[random_field] = args[random_field]
+                        args[random_field] = random.randint(0, (1<<53)-1)
                         params[random_field]["value"] = args[random_field]
+                        print(f"New random value for {random_field}: {args[random_field]}")
                         await self.client_queue.put({
                             "client_id": sid,
                             "data": {
@@ -461,23 +480,26 @@ class WebServer:
                 if action_name not in self.module_map[module_name]:
                     raise ValueError("Invalid action")
 
-                # import the module and get the action
                 if module_name.endswith(".custom"):
-                    module = import_module(f"custom.{module_name.replace('.custom', '')}.{module_name.replace('.custom', '')}")
+                    print(f"\nImporting custom module: {module_name}")
+                    mod = import_module(f"custom.{module_name.replace('.custom', '')}.{module_name.replace('.custom', '')}")
                 else:
-                    module = import_module(f"modules.{module_name}.{module_name}")
-                action = getattr(module, action_name)
+                    print(f"\nImporting standard module: {module_name}")
+                    mod = import_module(f"modules.{module_name}.{module_name}")
+                action = getattr(mod, action_name)
 
-                # if the node is not in the node store, initialize it
                 if node not in self.node_store:
+                    print(f"Initializing new node in store: {node}")
                     self.node_store[node] = action(node)
 
                 self.node_store[node]._client_id = sid
-
                 if not callable(self.node_store[node]):
-                    raise TypeError(f"The class `{module_name}.{action_name}` is not callable. Ensure that the class has a __call__ method or extend it from `NodeBase`.")
+                    raise TypeError(
+                        f"The class `{module_name}.{action_name}` is not callable. "
+                        f"Ensure that the class has a __call__ method or extend it from `NodeBase`."
+                    )
 
-                # initialize the progress bar
+                print("\nStarting node execution...")
                 await self.client_queue.put({
                     "client_id": sid,
                     "data": {
@@ -493,20 +515,23 @@ class WebServer:
                             return self.node_store[node](**args)
                         except StopIteration:
                             return None
-                            
+
                     result = await self.event_loop.run_in_executor(None, execute_node)
+                    print(f"Node execution completed with result type: {type(result)}")
                 except Exception as e:
+                    print(f"Error executing node: {str(e)}")
                     logger.error(f"Error executing node {module_name}.{action_name}: {str(e)}")
                     raise e
 
-                # Get execution type and compare outputs for continuous nodes
                 exec_type = self.module_map[module_name][action_name].get("execution_type", "workflow")
+                print(f"\nExecution type: {exec_type}")
+                new_output = self.node_store[node].output
+
                 if exec_type == "continuous":
-                    new_output = self.node_store[node].output
                     if not are_different(old_output, new_output):
-                        # If identical output, skip sending updates but still mark as executed
+                        print("Output unchanged, skipping updates")
                         logger.debug(f"Skipping updates for node {node} - output unchanged")
-                        execution_time = self.node_store[node]._execution_time if hasattr(self.node_store[node], '_execution_time') else 0
+                        execution_time = getattr(self.node_store[node], '_execution_time', 0)
                         await self.client_queue.put({
                             "client_id": sid,
                             "data": {
@@ -517,7 +542,8 @@ class WebServer:
                         })
                         continue
 
-                execution_time = self.node_store[node]._execution_time if hasattr(self.node_store[node], '_execution_time') else 0
+                execution_time = getattr(self.node_store[node], '_execution_time', 0)
+                print(f"Execution time: {execution_time:.2f}s")
 
                 await self.client_queue.put({
                     "client_id": sid,
@@ -527,62 +553,248 @@ class WebServer:
                         "time": f"{execution_time:.2f}",
                     }
                 })
-
                 logger.debug(f"Node {module_name}.{action_name} executed in {execution_time:.3f}s")
 
+                # Decide format based on node's type
                 for key in ui_fields:
+                    print(f"\nProcessing UI field: {key}")
                     source = ui_fields[key]["source"]
                     source_value = self.node_store[node].output[source]
+                    param_type = ui_fields[key]["type"].lower()
+
                     length = len(source_value) if isinstance(source_value, list) else 1
-                    format = ui_fields[key]["type"]
-                    if format == "image":
+                    if param_type == "image":
                         format = 'webp'
-                    elif format == "3d":
+                    elif param_type == "3d":
                         format = 'glb'
+                    elif param_type == "video":
+                        format = 'mp4'
                     else:
                         format = 'text'
-                    data = []
+
+                    print(f"Param type is '{param_type}', so using format='{format}'.  length={length}")
+
+                    data = None
+
                     if format == 'text':
                         data = {
                             "url": f"/view/{format}/{node}/{source}/{0}?t={time.time()}",
                             "value": source_value
                         }
-                    else:
-                        for i in range(length):
-                            if format == 'image':
-                                if length > 1:
-                                    scale = 0.5 if source_value[i].width > 1024 or source_value[i].height > 1024 else 1
-                                else:
-                                    scale = 0.5 if source_value[i].width > 2048 or source_value[i].height > 2048 else 1
-                                url = f"/view/{format}/{node}/{source}/{i}?scale={scale}&t={time.time()}"
-                                data.append({
-                                    "url": url,
-                                    "width": source_value[i].width,
-                                    "height": source_value[i].height
-                                })
-                            else:
-                                url = f"/view/{format}/{node}/{source}/{i}?t={time.time()}"
-                                data.append({
-                                    "url": url,
-                                })
 
+                    elif format == 'mp4':
+                        data = {
+                            "value": f"/view/{format}/{node}/{source}/{0}?t={time.time()}"
+                        }
+
+                    elif format == 'webp':
+                        data = []
+                        if not isinstance(source_value, list):
+                            source_value = [source_value]
+                        for i, val in enumerate(source_value):
+                            scale = 1
+                            if val.width > 1024 or val.height > 1024:
+                                scale = 0.5
+                            url = f"/view/{format}/{node}/{source}/{i}?scale={scale}&t={time.time()}"
+                            data.append({
+                                "url": url,
+                                "width": val.width,
+                                "height": val.height
+                            })
+
+                    elif format == 'glb':
+                        data = []
+                        if not isinstance(source_value, list):
+                            source_value = [source_value]
+                        for i, val in enumerate(source_value):
+                            url = f"/view/{format}/{node}/{source}/{i}?t={time.time()}"
+                            data.append({"url": url})
+
+                    print(f"Sending UI update for {key} => data={data}")
                     await self.client_queue.put({
                         "client_id": sid,
                         "data": {
-                            "type": ui_fields[key]["type"],
+                            "type": param_type,
                             "key": key,
                             "nodeId": node,
                             "data": data
-                            #"data": self.to_base64(ui_fields[key]["type"], value)
                         }
                     })
 
                 await asyncio.sleep(0)
+                print(f"\n=== Completed node {node} ===")
+
+        print("\n=== Graph execution completed ===")
+
+    async def list_files(self, request):
+        path = request.query.get('path', '')
+        if not path:
+            path = os.path.join('data', 'files')
+        
+        os.makedirs(path, exist_ok=True)
+
+        try:
+            requested_path = Path(path).resolve()
+            base_path = Path('data/files').resolve()
+            if not str(requested_path).startswith(str(base_path)) and path != 'data/files':
+                raise web.HTTPForbidden(text="Access to this directory is not allowed")
+        except (ValueError, RuntimeError):
+            raise web.HTTPBadRequest(text="Invalid path")
+
+        try:
+            entries = []
+            with os.scandir(path) as it:
+                for entry in it:
+                    entries.append({
+                        'name': entry.name,
+                        'isDirectory': entry.is_dir(),
+                        'path': os.path.join(path, entry.name).replace('\\', '/')
+                    })
+            entries.sort(key=lambda x: (not x['isDirectory'], x['name'].lower()))
+            return web.json_response({
+                'files': entries,
+                'currentPath': path.replace('\\', '/')
+            })
+        except Exception as e:
+            raise web.HTTPInternalServerError(text=str(e))
+
+    async def upload_file(self, request):
+        temp_file = None
+        try:
+            reader = await request.multipart()
+            file_field = await reader.next()
+            if file_field is None or file_field.name != 'file':
+                raise web.HTTPBadRequest(text="No valid file provided")
+            
+            filename = file_field.filename
+            if not filename:
+                raise web.HTTPBadRequest(text="No filename provided")
+            
+            save_path = os.path.join(os.getcwd(), 'data', 'files')
+            os.makedirs(save_path, exist_ok=True)
+            
+            fd, temp_path = tempfile.mkstemp(dir=save_path)
+            temp_file = os.fdopen(fd, 'wb')
+            
+            size = 0
+            try:
+                while True:
+                    chunk = await file_field.read_chunk(size=8*1024*1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    temp_file.write(chunk)
+                    if size % (64*1024*1024) == 0:
+                        temp_file.flush()
+                        os.fsync(temp_file.fileno())
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            finally:
+                temp_file.close()
+            
+            custom_filename = None
+            next_field = await reader.next()
+            if next_field and next_field.name == 'filename':
+                custom_filename = await next_field.text()
+            
+            base_filename = custom_filename or filename
+            original_name, original_ext = os.path.splitext(filename)
+            
+            if custom_filename:
+                custom_name, custom_ext = os.path.splitext(custom_filename)
+                if not custom_ext:
+                    base_filename = custom_name + original_ext
+            
+            counter = 1
+            final_filename = base_filename
+            while os.path.exists(os.path.join(save_path, final_filename)):
+                name, ext = os.path.splitext(base_filename)
+                final_filename = f"{name}_{counter}{ext}"
+                counter += 1
+            
+            final_path = os.path.join(save_path, final_filename)
+            os.rename(temp_path, final_path)
+            
+            return web.Response(text=final_filename)
+        except Exception as e:
+            if temp_file:
+                temp_file.close()
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+            raise web.HTTPInternalServerError(text=str(e))
+
+    async def get_file(self, request):
+        try:
+            filename = request.match_info['filename']
+            file_path = os.path.join(os.getcwd(), 'data', 'files', filename)
+            
+            logger.info(f"Attempting to serve file: {file_path}")
+            
+            if not os.path.exists(file_path):
+                logger.error(f"File not found: {file_path}")
+                raise web.HTTPNotFound(text=f"File not found: {filename}")
+            
+            if not os.access(file_path, os.R_OK):
+                logger.error(f"File not readable: {file_path}")
+                raise web.HTTPForbidden(text=f"File not readable: {filename}")
+                
+            file_size = os.path.getsize(file_path)
+            logger.info(f"File exists and is readable. Size: {file_size} bytes")
+
+            if filename.lower().endswith('.mp4'):
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                response = web.Response(
+                    body=data,
+                    content_type='video/mp4',
+                    headers={
+                        "Content-Length": str(file_size),
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                        "Pragma": "no-cache",
+                        "Expires": "0"
+                    }
+                )
+                logger.info("Serving MP4 file directly")
+                return response
+            
+            response = web.FileResponse(file_path)
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            response.headers["Content-Length"] = str(file_size)
+            
+            logger.info(f"Serving file with headers: {dict(response.headers)}")
+            return response
+            
+        except web.HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error serving file: {str(e)}")
+            raise web.HTTPInternalServerError(text=str(e))
+
+    async def delete_file(self, request):
+        try:
+            filename = request.match_info['filename']
+            file_path = os.path.join(os.getcwd(), 'data', 'files', filename)
+            
+            if not os.path.exists(file_path):
+                raise web.HTTPNotFound(text=f"File not found: {filename}")
+            
+            os.remove(file_path)
+            return web.Response(text=f"File {filename} deleted successfully")
+        except web.HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error deleting file: {str(e)}")
+            raise web.HTTPInternalServerError(text=str(e))
 
     """
     WebSocket API
     """
-
     async def websocket_handler(self, request):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
@@ -592,7 +804,6 @@ class WebServer:
             if sid in self.ws_clients:
                 del self.ws_clients[sid]
         else:
-            # if the client does not provide a session id, we create one for them one
             sid = nanoid.generate(size=10)
 
         self.ws_clients[sid] = ws
@@ -601,55 +812,22 @@ class WebServer:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
                 data = json.loads(msg.data)
-
                 try:
                     if data["type"] == "ping":
                         await ws.send_json({"type": "pong"})
                     elif data["type"] == "close":
                         await ws.close()
                         break
-                        """
-                    elif data["type"] == "module":
-                        module_name = data["module"]
-                        action_name = data["action"]
-                        params = data["data"] if "data" in data else {}
-
-                        if module_name not in self.module_map or action_name not in self.module_map[module_name]:
-                            raise ValueError("Invalid module or action")
-
-                        module = import_module(f"modules.{module_name}.{module_name}")
-                        action = getattr(module, action_name)
-                        result = await action(**params)
-                        await ws.send_json({"type": "result", "result": result})
-
-                    elif data["type"] == "graph":
-                        graph = data["graph"]
-                        for node in graph["nodes"]:
-                            module_name = node["module"]
-                            action_name = node["action"]
-                            params = node["params"]
-                            module = import_module(f"modules.{module_name}.{module_name}")
-                            action = getattr(module, action_name)
-                            result = await action(**params)
-                            await ws.send_json({"type": "result", "result": result})
-                        """
                     else:
                         raise ValueError("Invalid message type")
-
-                #except KeyError as e:
-                #    await ws.send_json({"type": "error", "message": f"Missing required field: {str(e)}"})
-                #except ValueError as e:
-                #    await ws.send_json({"type": "error", "message": str(e)})
                 except Exception as e:
                     logger.error(f"Unexpected error: {str(e)}")
                     await ws.send_json({"type": "error", "message": "An unexpected error occurred"})
-
             elif msg.type == WSMsgType.ERROR:
                 logger.error(f'WebSocket connection closed with exception {ws.exception()}')
 
         del self.ws_clients[sid]
         logger.info(f'WebSocket connection {sid} closed')
-
         return ws
 
     async def broadcast(self, message, client_id=None):
@@ -663,10 +841,6 @@ class WebServer:
         for client in ws_clients:
             await self.ws_clients[client].send_json(message)
 
-
-    """
-    Helper functions
-    """
     def to_base64(self, type, value):
         if type == "image":
             img_byte_arr = io.BytesIO()
@@ -681,7 +855,8 @@ class WebServer:
 
     def slugify(self, text):
         return re.sub(r'[^\w\s-]', '', text).strip().replace(' ', '-')
-1
+
+
 from modules import MODULE_MAP
 from config import config
 

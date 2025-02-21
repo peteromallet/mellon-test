@@ -5,9 +5,6 @@ import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
 import Button from '@mui/material/Button'
 import Stack from '@mui/material/Stack'
-//import IconButton from '@mui/material/IconButton'
-
-//import WifiIcon from '@mui/icons-material/Wifi';
 import { shallow } from 'zustand/shallow'
 import { NodeState, useNodeState } from '../stores/nodeStore'
 import { WebsocketState, useWebsocketState } from '../stores/websocketStore'
@@ -22,8 +19,15 @@ import SvgIcon from '@mui/material/SvgIcon'
 export default function AppToolbar() {
   const { setNodes, setEdges, toObject, setViewport } = useReactFlow();
   const theme = useTheme()
-  const { exportGraph } = useNodeState((state: NodeState) => ({ exportGraph: state.exportGraph }), shallow);
+  const { exportGraph, mode } = useNodeState(
+    (state: NodeState) => ({ 
+      exportGraph: state.exportGraph,
+      mode: state.mode,
+    }), 
+    shallow
+  );
   const { sid, isConnected } = useWebsocketState((state: WebsocketState) => ({ sid: state.sid, isConnected: state.isConnected }), shallow);
+
   const onRun = async () => {
     if (!isConnected) {
       console.error('Not connected to WebSocket server');
@@ -49,32 +53,42 @@ export default function AppToolbar() {
 
   const onExport = useCallback(() => {
     const flow = toObject();
-    const jsonString = JSON.stringify(flow, null, 2);
+    const jsonString = JSON.stringify({
+      ...flow,
+      type: mode
+    }, null, 2);
 
     // Create blob and download
     const blob = new Blob([jsonString], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'workflow.json';
+    
+    // For tools, include the date in the filename
+    const filename = mode === 'workflow' 
+      ? 'workflow.json'
+      : `tool-${new Date().toISOString().split('T')[0]}.json`;
+      
+    link.download = filename;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
-  }, [toObject]);
+  }, [toObject, mode]);
 
   const onNew = useCallback(() => {
     // Clear the nodes and edges
     setNodes([]);
     setEdges([]);
     
-    // Clear localStorage
-    localStorage.removeItem('workflow');
+    // Clear localStorage for current mode
+    const key = mode === 'workflow' ? 'workflow' : 'tool';
+    localStorage.removeItem(key);
     
     const defaultViewport = { x: 0, y: 0, zoom: 1 };
-    localStorage.setItem('workflow', JSON.stringify({ nodes: [], edges: [], viewport: defaultViewport }));
+    localStorage.setItem(key, JSON.stringify({ type: mode, nodes: [], edges: [], viewport: defaultViewport }));
     setViewport(defaultViewport);
-  }, [setNodes, setEdges]);
+  }, [setNodes, setEdges, mode]);
 
   return (
     <Box sx={{
@@ -107,11 +121,11 @@ export default function AppToolbar() {
           </Box>
 
           <Box>
-          <Button
+            <Button
               variant="text"
               startIcon={<InsertDriveFileOutlinedIcon />}
               onClick={onNew}
-              sx={{ mr: 1 }}  // Add margin between buttons
+              sx={{ mr: 1 }}
             >
               New
             </Button>
@@ -124,23 +138,25 @@ export default function AppToolbar() {
             </Button>
           </Box>
         </Stack>
+
         <Box>
-          <Button
-            variant="contained"
-            startIcon={<PlayArrowIcon />}
-            onClick={onRun}
-            disabled={!isConnected}
-            
-            sx={{
-              background: `linear-gradient(100deg, ${theme.palette.primary.main} 25%, #ff4259 90%)`,
-              '&.Mui-disabled': {
-                background: `linear-gradient(100deg, #6a6a6a, #303030)`,
-                color: '#1a1a1a',
-              }
-            }}
-          >
-            Run
-          </Button>
+          {mode === 'workflow' && (
+            <Button
+              variant="contained"
+              startIcon={<PlayArrowIcon />}
+              onClick={onRun}
+              disabled={!isConnected}
+              sx={{
+                background: `linear-gradient(100deg, ${theme.palette.primary.main} 25%, #ff4259 90%)`,
+                '&.Mui-disabled': {
+                  background: `linear-gradient(100deg, #6a6a6a, #303030)`,
+                  color: '#1a1a1a',
+                }
+              }}
+            >
+              Run
+            </Button>
+          )}
         </Box>
         <Box></Box>
       </Stack>

@@ -111,14 +111,15 @@ const CustomNode = memo((props: NodeProps<CustomNodeType>) => {
             <Box
                 component="header"
                 sx={{
-                    color: theme.palette.common.white,
+                    color: theme.palette.text.primary,
                     padding: 1,
                     borderTopWidth: '6px',
                     borderTopStyle: 'solid',
-                    borderTopColor: 'rgba(0, 0, 0)',
-                    backgroundColor: theme.palette.background.default,
+                    borderTopColor: theme.palette.primary.main,
+                    backgroundColor: theme.palette.background.paper,
                     fontSize: '16px',
-                    textShadow: '0px 2px 0px rgba(0, 0, 0, 0.75)',
+                    fontWeight: 500,
+                    borderBottom: `1px solid ${theme.palette.divider}`,
                 }}
             >
                 {nodeTitle}

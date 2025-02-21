@@ -455,6 +455,24 @@ from copy import deepcopy
 import random
 import signal
 import time
+import os
+import gc
+from pathlib import Path
+import tempfile
+
+def are_different(old_output, new_output):
+    """Compare two outputs to determine if they are different."""
+    if old_output is None or new_output is None:
+        return old_output is not new_output
+    if isinstance(old_output, dict) and isinstance(new_output, dict):
+        if old_output.keys() != new_output.keys():
+            return True
+        return any(are_different(old_output[k], new_output[k]) for k in old_output)
+    if isinstance(old_output, (list, tuple)) and isinstance(new_output, (list, tuple)):
+        if len(old_output) != len(new_output):
+            return True
+        return any(are_different(o, n) for o, n in zip(old_output, new_output))
+    return old_output != new_output
 
 class WebServer:
     def __init__(self, module_map: dict, host: str = "0.0.0.0", port: int = 8080, cors: bool = False, cors_route: str = "*"):
@@ -474,8 +492,13 @@ class WebServer:
         self.app.add_routes([web.get('/', self.index),
                              web.get('/nodes', self.nodes),
                              web.get('/view/{format}/{node}/{key}/{index}', self.view),
+                             web.get('/view/{format}/{node}/{key}', self.view),
                              web.get('/custom_component/{module}/{component}', self.custom_component),
                              web.get('/custom_assets/{module}/{file_path}', self.custom_assets),
+                             web.get('/files', self.list_files),
+                             web.post('/data/files', self.upload_file),
+                             web.get('/data/files/{filename}', self.get_file),
+                             web.delete('/data/files/{filename}', self.delete_file),
                              web.post('/graph', self.graph),
                              web.post('/nodeExecute', self.node_execute),                             
                              web.delete('/clearNodeCache', self.clear_node_cache),
@@ -661,6 +684,8 @@ class WebServer:
                     nodes[f"{module_name}-{action_name}"]["style"] = action['style']
                 if 'resizable' in action:
                     nodes[f"{module_name}-{action_name}"]["resizable"] = action['resizable']
+                if 'type' in action:
+                    nodes[f"{module_name}-{action_name}"]["type"] = action['type']
 
         return web.json_response(nodes)
     
@@ -816,26 +841,40 @@ class WebServer:
         })
 
     async def graph_execution(self, graph):
-        #graph = await request.json()
         sid = graph["sid"]
         nodes = graph["nodes"]
         paths = graph["paths"]
+        
+        print(f"\n=== Starting graph execution with SID: {sid} ===")
+        print(f"Number of nodes: {len(nodes)}")
+        print(f"Number of paths: {len(paths)}")
 
         randomized_fields = {}
-        for path in paths:
+        for path_index, path in enumerate(paths):
+            print(f"\n--- Processing path {path_index + 1}/{len(paths)} ---")
             for node in path:
                 module_name = nodes[node]["module"]
                 action_name = nodes[node]["action"]
+                print(f"\nExecuting node: {node}")
+                print(f"Module: {module_name}, Action: {action_name}")
                 logger.debug(f"Executing node {module_name}.{action_name}")
 
+                # Store old output for comparison
+                old_output = deepcopy(self.node_store[node].output) if node in self.node_store else None
+                print(f"Previous output exists: {old_output is not None}")
+
                 params = nodes[node]["params"]
+                print(f"Parameters: {params}")
                 ui_fields = {}
                 args = {}
                 for p in params:
                     source_id = params[p].get("sourceId")
                     source_key = params[p].get("sourceKey")
+                    print(f"\nProcessing parameter: {p}")
+                    print(f"Source ID: {source_id}, Source Key: {source_key}")
 
                     if "display" in params[p] and params[p]["display"] == "ui":
+                        print(f"UI field detected: {p} with type {params[p]['type']}")
                         # store ui fields that need to be sent back to the client
                         if params[p]["type"] == "image" or params[p]["type"] == "3d" or params[p]["type"] == "text":
                             ui_fields[p] = { "source": source_key, "type": params[p]["type"] }
@@ -843,6 +882,7 @@ class WebServer:
                         # handle list values (spawn input fields)
                         # if p ends with [d+], it means that the field is part of a list
                         if source_id and re.match(r".*\[\d+\]$", p):
+                            print(f"List field detected: {p}")
                             spawn_key = re.sub(r"\[\d+\]$", "", p)
                             if not args.get(spawn_key):
                                 args[spawn_key] = []
@@ -855,21 +895,27 @@ class WebServer:
                             # so we follow the connection to the source node and get the associated value
                             # Otherwise we use the value in the params
                             args[p] = self.node_store[source_id].output[source_key] if source_id else params[p].get("value")
+                            print(f"Regular field: {p} = {args[p]}")
+
+                print(f"\nFinal arguments for node execution: {args}")
+                print(f"UI fields to update: {ui_fields}")
 
                 # check if there is a field with the name __random__<param>
                 # randomize the field unless it has been already randomized
                 for key in args:
                     if key.startswith('__random__') and args[key] is True:
+                        print(f"\nRandomizing field: {key}")
                         if node not in randomized_fields:
                             randomized_fields[node] = []
                         if key in randomized_fields[node]:
+                            print(f"Field {key} already randomized, skipping")
                             continue
                         randomized_fields[node].append(key)
 
                         random_field = key.split('__random__')[1]
                         args[random_field] = random.randint(0, (1<<53)-1) # TODO: allow min/max values
-                        #self.node_store[node].params[random_field] = args[random_field]
                         params[random_field]["value"] = args[random_field]
+                        print(f"New random value for {random_field}: {args[random_field]}")
                         await self.client_queue.put({
                             "client_id": sid,
                             "data": {
@@ -887,13 +933,16 @@ class WebServer:
 
                 # import the module and get the action
                 if module_name.endswith(".custom"):
+                    print(f"\nImporting custom module: {module_name}")
                     module = import_module(f"custom.{module_name.replace('.custom', '')}.{module_name.replace('.custom', '')}")
                 else:
+                    print(f"\nImporting standard module: {module_name}")
                     module = import_module(f"modules.{module_name}.{module_name}")
                 action = getattr(module, action_name)
 
                 # if the node is not in the node store, initialize it
                 if node not in self.node_store:
+                    print(f"Initializing new node in store: {node}")
                     self.node_store[node] = action(node)
 
                 self.node_store[node]._client_id = sid
@@ -902,6 +951,7 @@ class WebServer:
                     raise TypeError(f"The class `{module_name}.{action_name}` is not callable. Ensure that the class has a __call__ method or extend it from `NodeBase`.")
 
                 # initialize the progress bar
+                print("\nStarting node execution...")
                 await self.client_queue.put({
                     "client_id": sid,
                     "data": {
@@ -916,15 +966,37 @@ class WebServer:
                         try:
                             return self.node_store[node](**args)
                         except StopIteration:
-                            # Handle StopIteration explicitly to prevent it from propagating
                             return None
                             
                     result = await self.event_loop.run_in_executor(None, execute_node)
+                    print(f"Node execution completed with result type: {type(result)}")
                 except Exception as e:
+                    print(f"Error executing node: {str(e)}")
                     logger.error(f"Error executing node {module_name}.{action_name}: {str(e)}")
                     raise e
 
+                # Get execution type and compare outputs for continuous nodes
+                exec_type = self.module_map[module_name][action_name].get("execution_type", "workflow")
+                print(f"\nExecution type: {exec_type}")
+                if exec_type == "continuous":
+                    new_output = self.node_store[node].output
+                    if not are_different(old_output, new_output):
+                        # If identical output, skip sending updates but still mark as executed
+                        print("Output unchanged, skipping updates")
+                        logger.debug(f"Skipping updates for node {node} - output unchanged")
+                        execution_time = self.node_store[node]._execution_time if hasattr(self.node_store[node], '_execution_time') else 0
+                        await self.client_queue.put({
+                            "client_id": sid,
+                            "data": {
+                                "type": "executed",
+                                "nodeId": node,
+                                "time": f"{execution_time:.2f}",
+                            }
+                        })
+                        continue
+
                 execution_time = self.node_store[node]._execution_time if hasattr(self.node_store[node], '_execution_time') else 0
+                print(f"Execution time: {execution_time:.2f}s")
 
                 await self.client_queue.put({
                     "client_id": sid,
@@ -932,14 +1004,13 @@ class WebServer:
                         "type": "executed",
                         "nodeId": node,
                         "time": f"{execution_time:.2f}",
-                        #"updateValues": updateValues
-                        #"memory": f"{memory_usage/1024**3:.2f}"
                     }
                 })
 
                 logger.debug(f"Node {module_name}.{action_name} executed in {execution_time:.3f}s")
 
                 for key in ui_fields:
+                    print(f"\nProcessing UI field: {key}")
                     source = ui_fields[key]["source"]
                     source_value = self.node_store[node].output[source]
                     length = len(source_value) if isinstance(source_value, list) else 1
@@ -948,8 +1019,11 @@ class WebServer:
                         format = 'webp'
                     elif format == "3d":
                         format = 'glb'
+                    elif format == "video":
+                        format = 'mp4'
                     else:
                         format = 'text'
+                    print(f"Format: {format}, Length: {length}")
                     data = []
                     if format == 'text':
                         data = {
@@ -975,6 +1049,7 @@ class WebServer:
                                     "url": url,
                                 })
 
+                    print(f"Sending UI update for {key}")
                     await self.client_queue.put({
                         "client_id": sid,
                         "data": {
@@ -982,20 +1057,204 @@ class WebServer:
                             "key": key,
                             "nodeId": node,
                             "data": data
-                            #"data": self.to_base64(ui_fields[key]["type"], value)
                         }
                     })
 
                 await asyncio.sleep(0)
+                print(f"\n=== Completed node {node} ===")
 
-        # if updateValues:
-        #     await self.client_queue.put({
-        #         "client_id": sid,
-        #         "data": {
-        #             "type": "updateValues",
-        #             "values": updateValues
-        #         }
-        #     })
+        print("\n=== Graph execution completed ===")
+
+    async def list_files(self, request):
+        # Get the requested path from query params, default to data/files
+        path = request.query.get('path', '')
+        if not path:
+            path = os.path.join('data', 'files')
+        
+        # Ensure the path exists and create if it doesn't
+        os.makedirs(path, exist_ok=True)
+
+        # Security check - ensure path is within allowed directory
+        try:
+            requested_path = Path(path).resolve()
+            base_path = Path('data/files').resolve()
+            if not str(requested_path).startswith(str(base_path)) and path != 'data/files':
+                raise web.HTTPForbidden(text="Access to this directory is not allowed")
+        except (ValueError, RuntimeError):
+            raise web.HTTPBadRequest(text="Invalid path")
+
+        try:
+            # List directory contents
+            entries = []
+            with os.scandir(path) as it:
+                for entry in it:
+                    entries.append({
+                        'name': entry.name,
+                        'isDirectory': entry.is_dir(),
+                        'path': os.path.join(path, entry.name).replace('\\', '/')
+                    })
+            
+            # Sort directories first, then files, both alphabetically
+            entries.sort(key=lambda x: (not x['isDirectory'], x['name'].lower()))
+            
+            return web.json_response({
+                'files': entries,
+                'currentPath': path.replace('\\', '/')
+            })
+        except Exception as e:
+            raise web.HTTPInternalServerError(text=str(e))
+
+    async def upload_file(self, request):
+        """Handle file uploads to data/files directory."""
+        temp_file = None
+        try:
+            reader = await request.multipart()
+            
+            file_field = await reader.next()
+            if file_field is None or file_field.name != 'file':
+                raise web.HTTPBadRequest(text="No valid file provided")
+            
+            filename = file_field.filename
+            if not filename:
+                raise web.HTTPBadRequest(text="No filename provided")
+            
+            save_path = os.path.join(os.getcwd(), 'data', 'files')
+            os.makedirs(save_path, exist_ok=True)
+            
+            # Create a temporary file first
+            fd, temp_path = tempfile.mkstemp(dir=save_path)
+            temp_file = os.fdopen(fd, 'wb')
+            
+            size = 0
+            try:
+                while True:
+                    chunk = await file_field.read_chunk(size=8*1024*1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    temp_file.write(chunk)
+                    if size % (64*1024*1024) == 0:
+                        temp_file.flush()
+                        os.fsync(temp_file.fileno())
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+            finally:
+                temp_file.close()
+            
+            # Get custom filename if provided
+            custom_filename = None
+            next_field = await reader.next()
+            if next_field and next_field.name == 'filename':
+                custom_filename = await next_field.text()
+            
+            # Generate final filename with proper extension
+            base_filename = custom_filename or filename
+            original_name, original_ext = os.path.splitext(filename)
+            
+            if custom_filename:
+                custom_name, custom_ext = os.path.splitext(custom_filename)
+                # If custom filename has no extension, use original file's extension
+                if not custom_ext:
+                    base_filename = custom_name + original_ext
+            
+            # Generate unique filename by adding counter if needed
+            counter = 1
+            final_filename = base_filename
+            while os.path.exists(os.path.join(save_path, final_filename)):
+                name, ext = os.path.splitext(base_filename)
+                final_filename = f"{name}_{counter}{ext}"
+                counter += 1
+            
+            final_path = os.path.join(save_path, final_filename)
+            
+            # Atomically move the temporary file to its final location
+            os.rename(temp_path, final_path)
+            
+            return web.Response(text=final_filename)
+            
+        except Exception as e:
+            # Clean up temporary file if something went wrong
+            if temp_file:
+                temp_file.close()
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except Exception:
+                        pass
+            raise web.HTTPInternalServerError(text=str(e))
+
+    async def get_file(self, request):
+        """Serve files from data/files directory."""
+        try:
+            filename = request.match_info['filename']
+            file_path = os.path.join(os.getcwd(), 'data', 'files', filename)
+            
+            logger.info(f"Attempting to serve file: {file_path}")
+            
+            if not os.path.exists(file_path):
+                logger.error(f"File not found: {file_path}")
+                raise web.HTTPNotFound(text=f"File not found: {filename}")
+            
+            # Check if file is readable
+            if not os.access(file_path, os.R_OK):
+                logger.error(f"File not readable: {file_path}")
+                raise web.HTTPForbidden(text=f"File not readable: {filename}")
+                
+            file_size = os.path.getsize(file_path)
+            logger.info(f"File exists and is readable. Size: {file_size} bytes")
+
+            # For MP4 files, use direct file reading instead of FileResponse
+            if filename.lower().endswith('.mp4'):
+                with open(file_path, 'rb') as f:
+                    data = f.read()
+                
+                response = web.Response(
+                    body=data,
+                    content_type='video/mp4',
+                    headers={
+                        "Content-Length": str(file_size),
+                        "Accept-Ranges": "bytes",
+                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                        "Pragma": "no-cache",
+                        "Expires": "0"
+                    }
+                )
+                logger.info("Serving MP4 file directly")
+                return response
+            
+            # For all other files, use FileResponse
+            response = web.FileResponse(file_path)
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+            response.headers["Content-Length"] = str(file_size)
+            
+            logger.info(f"Serving file with headers: {dict(response.headers)}")
+            return response
+            
+        except web.HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error serving file: {str(e)}")
+            raise web.HTTPInternalServerError(text=str(e))
+
+    async def delete_file(self, request):
+        """Delete files from data/files directory."""
+        try:
+            filename = request.match_info['filename']
+            file_path = os.path.join(os.getcwd(), 'data', 'files', filename)
+            
+            if not os.path.exists(file_path):
+                raise web.HTTPNotFound(text=f"File not found: {filename}")
+            
+            os.remove(file_path)
+            return web.Response(text=f"File {filename} deleted successfully")
+            
+        except web.HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error deleting file: {str(e)}")
+            raise web.HTTPInternalServerError(text=str(e))
 
     """
     WebSocket API
@@ -1099,7 +1358,7 @@ class WebServer:
 
     def slugify(self, text):
         return re.sub(r'[^\w\s-]', '', text).strip().replace(' ', '-')
-1
+
 from modules import MODULE_MAP
 from config import config
 
@@ -1111,18 +1370,1094 @@ FILE: modules/Text/Text.py
 ================================================================================
 
 from mellon.NodeBase import NodeBase
+import torch
+import gc
+import os
+import time
+import csv
+import glob
+import uuid
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+from torch.cuda import max_memory_allocated, synchronize
+from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL, FluxPriorReduxPipeline
+from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
+from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
+from diffusers.utils import load_image
+from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from functools import wraps
+from typing import List, Dict, Tuple, Optional
+from huggingface_hub import login
 
+##
+# Other Node classes remain as before
+##
 class Text(NodeBase):
     def execute(self, text_field):
         return text_field
-    
+
 class Text2(NodeBase):
     def execute(self, text_field):
         return text_field
 
 class DisplayText(NodeBase):
+    def execute(self, text_in, text_in_2, video_display):
+        print(text_in+text_in_2)
+        return {"text_out": text_in + text_in_2, "video_out": "data.mp4"}
+
+class LoadAudio(NodeBase):
+    def execute(self, audio_file):
+        return audio_file
+
+class Timeline(NodeBase):
+    def execute(self, audio_file, timestamps):
+        return {"audio_file_out": audio_file, "timestamps_out": timestamps}
+
+class FluxTravelBase:
+    """
+    Utility class containing shared functionality for FluxTravel nodes.
+    All methods are class methods to avoid initialization issues.
+    """
+    @classmethod
+    def timing_decorator(cls, func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            start = time.time()
+            result = func(*args, **kwargs)
+            duration = time.time() - start
+            print(f"{func.__name__}: {duration:.2f}s")
+            return result
+        return wrapper
+
+    @classmethod
+    def add_timing_to_pipeline(cls, pipe):
+        if hasattr(pipe, 'encode_image'):
+            pipe.encode_image = cls.timing_decorator(pipe.encode_image)
+        if hasattr(pipe, 'encode_prompt'):
+            pipe.encode_prompt = cls.timing_decorator(pipe.encode_prompt)
+        if hasattr(pipe, 'vae_encode'):
+            pipe.vae_encode = cls.timing_decorator(pipe.vae_encode)
+        return pipe
+
+    @staticmethod
+    def setup_pipeline():
+        """
+        Sets up the pipeline objects (FluxPipeline, prior, etc.).
+        """
+        dtype = torch.bfloat16
+        bfl_repo = "black-forest-labs/FLUX.1-schnell"
+        revision = "refs/pr/1"
+
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            bfl_repo, subfolder="scheduler", revision=revision
+        )
+        text_encoder = CLIPTextModel.from_pretrained(
+            "openai/clip-vit-large-patch14", torch_dtype=dtype
+        )
+        tokenizer = CLIPTokenizer.from_pretrained(
+            "openai/clip-vit-large-patch14", torch_dtype=dtype
+        )
+        text_encoder_2 = T5EncoderModel.from_pretrained(
+            bfl_repo, subfolder="text_encoder_2", torch_dtype=dtype, revision=revision
+        )
+        tokenizer_2 = T5TokenizerFast.from_pretrained(
+            bfl_repo, subfolder="tokenizer_2", torch_dtype=dtype, revision=revision
+        )
+        vae = AutoencoderKL.from_pretrained(
+            bfl_repo, subfolder="vae", torch_dtype=dtype, revision=revision
+        )
+        transformer = FluxTransformer2DModel.from_pretrained(
+            bfl_repo, subfolder="transformer", torch_dtype=dtype, revision=revision
+        )
+
+        pipe = FluxPipeline(
+            scheduler=scheduler,
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            text_encoder_2=None,
+            tokenizer_2=tokenizer_2,
+            vae=vae,
+            transformer=None,
+        )
+        pipe.text_encoder_2 = text_encoder_2
+        pipe.transformer = transformer
+        pipe.enable_model_cpu_offload()
+
+        pipe = FluxTravelBase.add_timing_to_pipeline(pipe)
+
+        # Also load the Redux pipeline
+        repo_redux = "black-forest-labs/FLUX.1-Redux-dev"
+        pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(repo_redux, torch_dtype=dtype)
+        pipe_prior_redux = FluxTravelBase.add_timing_to_pipeline(pipe_prior_redux)
+
+        return pipe, pipe_prior_redux, dtype
+
+    @staticmethod
+    def slerp(val, low, high, eps=1e-6):
+        """
+        Spherical linear interpolation.
+        """
+        low_norm = low / (torch.norm(low, dim=-1, keepdim=True) + eps)
+        high_norm = high / (torch.norm(high, dim=-1, keepdim=True) + eps)
+        dot = (low_norm * high_norm).sum(-1, keepdim=True)
+        dot = torch.clamp(dot, -1.0, 1.0)
+        omega = torch.acos(dot)
+        so = torch.sin(omega)
+        return torch.where(
+            so < eps,
+            (1.0 - val) * low + val * high,
+            ((torch.sin((1.0 - val) * omega) / so) * low +
+             (torch.sin(val * omega) / so) * high)
+        )
+
+    @classmethod
+    def blend_embeddings(cls, embeddings: List[Tuple[torch.Tensor, float]], blend_mode: str = 'linear') -> torch.Tensor:
+        """
+        Blend multiple embeddings according to strengths.
+        """
+        if blend_mode == 'linear':
+            total = sum(strength for _, strength in embeddings)
+            return sum(emb * (strength / total) for emb, strength in embeddings)
+        elif blend_mode == 'slerp':
+            # If only two embeddings, do a single slerp
+            if len(embeddings) == 2:
+                emb1, strength1 = embeddings[0]
+                emb2, strength2 = embeddings[1]
+                total = strength1 + strength2
+                val = strength2 / total
+                return cls.slerp(val, emb1, emb2)
+            else:
+                # Fallback if 3+ embeddings with slerp
+                total = sum(strength for _, strength in embeddings)
+                strengths = [strength / total for _, strength in embeddings]
+                val1 = strengths[1] / (strengths[0] + strengths[1])
+                intermediate = cls.slerp(val1, embeddings[0][0], embeddings[1][0])
+                val2 = strengths[2]
+                return cls.slerp(val2, intermediate, embeddings[2][0])
+        else:
+            raise ValueError(f"Unknown blend mode: {blend_mode}")
+
+    @staticmethod
+    def linear_interpolate(x1, y1, x2, y2, x):
+        if abs(x2 - x1) < 1e-9:
+            return y1
+        ratio = (x - x1) / (x2 - x1)
+        return y1 + ratio * (y2 - y1)
+
+    @classmethod
+    def generate_strength_data(cls, image_names, timestamps, fps, peak_strength,
+                               low_strength, blend_amount):
+        """
+        Generate a list of dictionaries: each dict has frame #, time, and
+        an array of strengths for each image.
+        """
+        N = len(image_names)
+        boundaries = []
+
+        # Calculate left/right boundaries for each image
+        for i in range(N):
+            if i == 0:
+                lb = timestamps[0]
+                rb = timestamps[0] + blend_amount * (timestamps[1] - timestamps[0]) if N > 1 else timestamps[0]
+            elif i < N - 1:
+                lb = timestamps[i] - blend_amount * (timestamps[i] - timestamps[i - 1])
+                rb = timestamps[i] + blend_amount * (timestamps[i + 1] - timestamps[i])
+            else:
+                # Last image
+                lb = timestamps[i] - blend_amount * (timestamps[i] - timestamps[i - 1])
+                rb = timestamps[i]
+            boundaries.append((lb, rb))
+
+        final_timestamp = timestamps[-1]
+        total_frames = int(np.ceil(final_timestamp * fps)) + 1
+
+        data = []
+        for frame_idx in range(total_frames):
+            t = frame_idx / fps
+            strengths_for_frame = []
+            for i in range(N):
+                lb, rb = boundaries[i]
+                peak_time = timestamps[i]
+
+                if i == N - 1 and abs(t - final_timestamp) < 1e-9:
+                    strengths_for_frame.append(peak_strength)
+                    continue
+
+                # Outside active window
+                if t < lb or t > rb:
+                    strengths_for_frame.append(0.0)
+                    continue
+
+                if i == 0:
+                    # First image
+                    if t <= peak_time:
+                        strengths_for_frame.append(peak_strength)
+                    else:
+                        val = cls.linear_interpolate(peak_time, peak_strength, rb, low_strength, t)
+                        strengths_for_frame.append(val)
+                elif i == N - 1:
+                    # Last image
+                    if t <= peak_time:
+                        val = cls.linear_interpolate(lb, low_strength, peak_time, peak_strength, t)
+                        strengths_for_frame.append(val)
+                    else:
+                        ramp_down_end = max(final_timestamp - 1.0/fps, peak_time)
+                        if t < ramp_down_end:
+                            val = cls.linear_interpolate(peak_time, peak_strength, ramp_down_end, low_strength, t)
+                            strengths_for_frame.append(val)
+                        else:
+                            strengths_for_frame.append(low_strength)
+                else:
+                    # Intermediate images
+                    if t <= peak_time:
+                        val = cls.linear_interpolate(lb, low_strength, peak_time, peak_strength, t)
+                    else:
+                        val = cls.linear_interpolate(peak_time, peak_strength, rb, low_strength, t)
+                    strengths_for_frame.append(val)
+
+            # Round to 3 decimals
+            strengths_for_frame = [float(f"{s:.3f}") for s in strengths_for_frame]
+            data.append({
+                'frame': frame_idx,
+                'time': float(f"{t:.3f}"),
+                'strengths': strengths_for_frame
+            })
+
+        return data
+
+    @classmethod
+    def process_image_batch(cls, image_paths: List[str],
+                            pipe,
+                            pipe_prior_redux,
+                            frames_per_transition: List[int],
+                            height: int = 720,
+                            width: int = 720,
+                            noise_blend_amount: float = 0.1,
+                            num_inference_steps: int = 4,
+                            guidance_scale: float = 1.5,
+                            seed: int = 12345,
+                            info_mode: bool = False,
+                            low_strength: float = 0.0,
+                            peak_strength: float = 1.0,
+                            blend_mode: str = 'linear',
+                            csv_only: bool = False,
+                            blend_amount: float = 1.0):
+        """
+        Original approach: piecewise interpolation between consecutive images,
+        given a fixed number of frames_per_transition between them.
+        """
+        generator = torch.Generator(device=pipe.device).manual_seed(seed)
+        print(f"\nEncoding {len(image_paths)} images...")
+        encoded_images = {}
+        source_images = {}
+
+        # Encode each image with the "Redux" pipeline
+        for img_path in image_paths:
+            img_name = os.path.basename(img_path)
+            img = load_image(img_path)
+            source_images[img_name] = img
+            if not csv_only:
+                base_output = pipe_prior_redux(
+                    img,
+                    prompt_embeds_scale=1.0,
+                    pooled_prompt_embeds_scale=1.0
+                )
+                encoded_images[img_name] = {
+                    'prompt_embeds': base_output['prompt_embeds'],
+                    'pooled_prompt_embeds': base_output['pooled_prompt_embeds']
+                }
+
+        results = []
+        generation_times = []
+        frame_info = [] if info_mode or csv_only else None
+        frame_number = 0
+
+        # Generate frames for each pair
+        for i in range(len(image_paths) - 1):
+            img1_name = os.path.basename(image_paths[i])
+            img2_name = os.path.basename(image_paths[i + 1])
+            num_frames = frames_per_transition[i] if i < len(frames_per_transition) else frames_per_transition[-1]
+
+            if not csv_only:
+                print(f"\nGenerating {num_frames} frames between {img1_name} and {img2_name}")
+
+            previous_latents = None
+            for j in range(num_frames):
+                # OLD Cosine-based interpolation:
+                progress = j / (num_frames - 1) if num_frames > 1 else 0.0
+                adjusted_progress = progress ** (1 / blend_amount)
+                cos_progress = (1 - np.cos(adjusted_progress * np.pi)) / 2
+
+                strength1 = (1 - cos_progress) * (peak_strength - low_strength) + low_strength
+                strength2 = cos_progress * (peak_strength - low_strength) + low_strength
+                total = strength1 + strength2
+                strength1 /= total
+                strength2 /= total
+
+                if frame_info is not None:
+                    active_images_paths = [image_paths[i], image_paths[i+1]]
+                    active_strengths = [strength1, strength2]
+
+                if not csv_only:
+                    # Combine embeddings
+                    prompt_embeds_list = [
+                        (encoded_images[img1_name]['prompt_embeds'], strength1),
+                        (encoded_images[img2_name]['prompt_embeds'], strength2)
+                    ]
+                    pooled_embeds_list = [
+                        (encoded_images[img1_name]['pooled_prompt_embeds'], strength1),
+                        (encoded_images[img2_name]['pooled_prompt_embeds'], strength2)
+                    ]
+                    combined_output = {
+                        'prompt_embeds': cls.blend_embeddings(prompt_embeds_list, blend_mode),
+                        'pooled_prompt_embeds': cls.blend_embeddings(pooled_embeds_list, blend_mode)
+                    }
+
+                    # Prepare latents
+                    if previous_latents is None:
+                        latents, _ = pipe.prepare_latents(
+                            batch_size=1,
+                            num_channels_latents=pipe.transformer.config.in_channels // 4,
+                            height=height,
+                            width=width,
+                            dtype=pipe.dtype,
+                            device=pipe.device,
+                            generator=generator
+                        )
+                        batch_size, seq_len, hidden_dim = latents.shape
+                        latents = latents.view(batch_size, seq_len, -1)
+                    else:
+                        new_latents, _ = pipe.prepare_latents(
+                            batch_size=1,
+                            num_channels_latents=pipe.transformer.config.in_channels // 4,
+                            height=height,
+                            width=width,
+                            dtype=pipe.dtype,
+                            device=pipe.device,
+                            generator=generator
+                        )
+                        new_latents = new_latents.view(batch_size, seq_len, -1)
+                        if noise_blend_amount is not None:
+                            latents = (1 - noise_blend_amount) * previous_latents + noise_blend_amount * new_latents
+                        else:
+                            latents = previous_latents
+
+                    previous_latents = latents
+
+                    t_start = time.time()
+                    image = pipe(
+                        width=width,
+                        height=height,
+                        num_inference_steps=num_inference_steps,
+                        guidance_scale=guidance_scale,
+                        latents=latents,
+                        **combined_output,
+                    ).images[0]
+                    gen_time = time.time() - t_start
+
+                    if info_mode:
+                        image = cls.add_frame_info(
+                            image,
+                            frame_number,
+                            [source_images[os.path.basename(img_path)] for img_path in active_images_paths],
+                            active_strengths
+                        )
+
+                    results.append(image)
+                    generation_times.append(gen_time)
+
+                if frame_info is not None:
+                    frame_info_dict = {'frame': frame_number}
+                    frame_info_dict[f'image_{i+1}_redux_strength'] = strength1
+                    frame_info_dict[f'image_{i+2}_redux_strength'] = strength2
+                    frame_info.append(frame_info_dict)
+
+                frame_number += 1
+                synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+                if not csv_only:
+                    print(f"  Frame {j+1}/{num_frames}", end="\r")
+            if not csv_only:
+                print()  # new line
+
+        return results, generation_times, frame_info
+
+    @classmethod
+    def process_timestamped_images(cls,
+                                   image_paths: List[str],
+                                   timestamps: List[float],
+                                   fps: float,
+                                   pipe,
+                                   pipe_prior_redux,
+                                   height: int = 720,
+                                   width: int = 720,
+                                   noise_blend_amount: float = 0.1,
+                                   steps: int = 4,
+                                   guidance_scale: float = 1.5,
+                                   seed: int = 12345,
+                                   info_mode: bool = False,
+                                   low_strength: float = 0.0,
+                                   peak_strength: float = 1.0,
+                                   blend_mode: str = 'linear',
+                                   csv_only: bool = False,
+                                   blend_amount: float = 1.0):
+        """
+        Uses the new snippet-based curve to determine strengths for each image,
+        given specific timestamps (in seconds).
+        """
+        if len(image_paths) != len(timestamps):
+            raise ValueError("Number of images must match number of timestamps")
+        if len(image_paths) < 2:
+            raise ValueError("Need at least 2 images to create sequence")
+        if not all(timestamps[i] < timestamps[i+1] for i in range(len(timestamps)-1)):
+            raise ValueError("Timestamps must be in ascending order")
+
+        generator = torch.Generator(device=pipe.device).manual_seed(seed)
+
+        print(f"\nEncoding {len(image_paths)} images (timestamped logic)...")
+        encoded_images = {}
+        source_images = {}
+        for img_path in image_paths:
+            img_name = os.path.basename(img_path)
+            img = load_image(img_path)
+            source_images[img_name] = img
+            if not csv_only:
+                base_output = pipe_prior_redux(
+                    img,
+                    prompt_embeds_scale=1.0,
+                    pooled_prompt_embeds_scale=1.0
+                )
+                encoded_images[img_name] = {
+                    'prompt_embeds': base_output['prompt_embeds'],
+                    'pooled_prompt_embeds': base_output['pooled_prompt_embeds']
+                }
+
+        results = []
+        generation_times = []
+        frame_info = [] if info_mode or csv_only else None
+
+        # Strength data for each frame
+        image_names_for_snippet = [os.path.basename(p) for p in image_paths]
+        strength_data = cls.generate_strength_data(
+            image_names_for_snippet,
+            timestamps,
+            fps,
+            peak_strength,
+            low_strength,
+            blend_amount
+        )
+
+        previous_latents = None
+        for frame_item in strength_data:
+            frame_idx = frame_item['frame']
+            strengths = frame_item['strengths']
+
+            if frame_info is not None:
+                info_dict = {'frame': frame_idx}
+                for i, s in enumerate(strengths):
+                    info_dict[f'image_{i+1}_redux_strength'] = s
+                frame_info.append(info_dict)
+
+            if csv_only:
+                continue
+
+            # Weighted sum of embeddings
+            total_strength = sum(strengths)
+            if total_strength < 1e-9:
+                # All zero => produce random latents / skip
+                combined_prompt_embeds = None
+                combined_pooled_embeds = None
+            else:
+                emb_sum = None
+                pooled_sum = None
+                for i, val in enumerate(strengths):
+                    if val <= 0.0:
+                        continue
+                    img_name = os.path.basename(image_paths[i])
+                    w = val / total_strength
+                    if emb_sum is None:
+                        emb_sum = encoded_images[img_name]['prompt_embeds'] * w
+                        pooled_sum = encoded_images[img_name]['pooled_prompt_embeds'] * w
+                    else:
+                        emb_sum = emb_sum + encoded_images[img_name]['prompt_embeds'] * w
+                        pooled_sum = pooled_sum + encoded_images[img_name]['pooled_prompt_embeds'] * w
+
+                combined_prompt_embeds = emb_sum
+                combined_pooled_embeds = pooled_sum
+
+            # Prepare latents
+            if previous_latents is None:
+                latents, _ = pipe.prepare_latents(
+                    batch_size=1,
+                    num_channels_latents=pipe.transformer.config.in_channels // 4,
+                    height=height,
+                    width=width,
+                    dtype=pipe.dtype,
+                    device=pipe.device,
+                    generator=generator
+                )
+                batch_size, seq_len, hidden_dim = latents.shape
+                latents = latents.view(batch_size, seq_len, -1)
+            else:
+                new_latents, _ = pipe.prepare_latents(
+                    batch_size=1,
+                    num_channels_latents=pipe.transformer.config.in_channels // 4,
+                    height=height,
+                    width=width,
+                    dtype=pipe.dtype,
+                    device=pipe.device,
+                    generator=generator
+                )
+                new_latents = new_latents.view(batch_size, seq_len, -1)
+                if noise_blend_amount is not None:
+                    latents = (1 - noise_blend_amount) * previous_latents + noise_blend_amount * new_latents
+                else:
+                    latents = previous_latents
+
+            previous_latents = latents
+
+            if combined_prompt_embeds is None:
+                combined_output = {}
+            else:
+                combined_output = {
+                    'prompt_embeds': combined_prompt_embeds,
+                    'pooled_prompt_embeds': combined_pooled_embeds
+                }
+
+            t_start = time.time()
+            image = pipe(
+                width=width,
+                height=height,
+                num_inference_steps=steps,
+                guidance_scale=guidance_scale,
+                latents=latents,
+                **combined_output,
+            ).images[0]
+            gen_time = time.time() - t_start
+            generation_times.append(gen_time)
+
+            if info_mode:
+                active_img_paths = image_paths
+                active_strengths = strengths
+                image = cls.add_frame_info(
+                    image,
+                    frame_idx,
+                    [source_images[os.path.basename(p)] for p in active_img_paths],
+                    active_strengths
+                )
+
+            results.append(image)
+
+            synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        return results, generation_times, frame_info
+
+    @staticmethod
+    def create_interpolation_video(results,
+                                   output_path='interpolation.mp4',
+                                   fps=12,
+                                   resize_width=512,
+                                   resize_height=512,
+                                   audio_path=None,
+                                   start_time=None,
+                                   end_time=None,
+                                   skip_frame_save=False,
+                                   frame_info=None):
+        """
+        Create a video from a sequence of images; optionally attach audio.
+        """
+        import subprocess
+
+        output_dir = os.path.splitext(output_path)[0] + "_frames"
+        if not skip_frame_save:
+            if os.path.exists(output_dir):
+                import shutil
+                shutil.rmtree(output_dir)
+            os.makedirs(output_dir)
+
+            print(f"\nSaving frames to {output_dir}/")
+            for i, img in enumerate(results):
+                img = img.resize((resize_width, resize_height), Image.Resampling.LANCZOS)
+                frame_path = os.path.join(output_dir, f"frame_{i:04d}.png")
+                img.save(frame_path)
+                print(f"  Frame {i+1}/{len(results)}", end="\r")
+            print()
+
+            # Optionally save frame info to CSV
+            if frame_info:
+                csv_path = os.path.splitext(output_path)[0] + "_frame_info.csv"
+                image_keys = set()
+                for info in frame_info:
+                    for key in info.keys():
+                        if key.startswith('image_') and key.endswith('_redux_strength'):
+                            image_keys.add(key)
+                sorted_image_keys = sorted(image_keys)
+                fieldnames = ['frame'] + [f'image_{key.split("_")[1]}' for key in sorted_image_keys]
+
+                with open(csv_path, 'w', newline='') as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for info in frame_info:
+                        row = {'frame': info['frame']}
+                        for key in sorted_image_keys:
+                            image_num = key.split('_')[1]
+                            row[f'image_{image_num}'] = info.get(key, 0.0)
+                        writer.writerow(row)
+
+                print(f"Frame information saved to {csv_path}")
+
+        # Build the video (via ffmpeg)
+        try:
+            current_dir = os.getcwd()
+            os.chdir(output_dir)
+            output_path_abs = os.path.abspath(os.path.join(current_dir, output_path))
+            audio_path_abs = os.path.abspath(os.path.join(current_dir, audio_path)) if audio_path else None
+
+            temp_video_path = f"{output_path_abs}.{uuid.uuid4()}.temp.mp4" if audio_path else None
+            initial_output = temp_video_path if audio_path else output_path_abs
+
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-framerate", str(fps),
+                "-i", "frame_%04d.png",
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                initial_output
+            ]
+
+            print(f"\nCreating video {output_path}")
+            result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                print("\nError creating video:")
+                print("STDOUT:", result.stdout)
+                print("STDERR:", result.stderr)
+                raise subprocess.CalledProcessError(result.returncode, ffmpeg_cmd, result.stdout, result.stderr)
+
+            # If we have audio, we need to run a second ffmpeg pass
+            if audio_path:
+                if not os.path.exists(audio_path_abs):
+                    raise FileNotFoundError(f"Audio file not found: {audio_path_abs}")
+
+                # Trim audio if needed
+                probe_cmd = [
+                    "ffprobe",
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    audio_path_abs
+                ]
+                try:
+                    audio_duration = float(subprocess.check_output(probe_cmd, text=True).strip())
+                except (subprocess.CalledProcessError, ValueError):
+                    audio_duration = None
+
+                video_duration = len(results) / fps
+                if start_time is not None and audio_duration is not None:
+                    if start_time >= audio_duration:
+                        raise ValueError(f"Start time {start_time}s is beyond audio duration {audio_duration}s")
+                if end_time is not None and audio_duration is not None:
+                    if end_time > audio_duration:
+                        print(f"\nWarning: End time {end_time}s is beyond audio duration {audio_duration}s")
+                        print("Audio will be shorter than video")
+
+                audio_filter = []
+                if start_time is not None or end_time is not None:
+                    trim_args = []
+                    if start_time is not None:
+                        trim_args.append(f"start={start_time}")
+                    if end_time is not None:
+                        trim_args.append(f"end={end_time}")
+                    audio_filter.append(f"atrim={':'.join(trim_args)}")
+                    audio_filter.append("asetpts=PTS-STARTPTS")
+
+                filter_str = ",".join(audio_filter) if audio_filter else None
+                audio_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", temp_video_path,
+                    "-i", audio_path_abs
+                ]
+                if filter_str:
+                    audio_cmd.extend(["-af", filter_str])
+                audio_cmd.extend([
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    output_path_abs
+                ])
+
+                print("\nAdding audio to video")
+                result = subprocess.run(audio_cmd, capture_output=True, text=True)
+                if os.path.exists(temp_video_path):
+                    os.remove(temp_video_path)
+
+                if result.returncode != 0:
+                    print("\nError adding audio:")
+                    print("STDOUT:", result.stdout)
+                    print("STDERR:", result.stderr)
+                    raise subprocess.CalledProcessError(result.returncode, audio_cmd, result.stdout, result.stderr)
+
+                if audio_duration is not None:
+                    print(f"\nVideo duration: {video_duration:.2f}s")
+                    print(f"Original audio duration: {audio_duration:.2f}s")
+                    if start_time is not None or end_time is not None:
+                        trimmed_duration = (end_time or audio_duration) - (start_time or 0)
+                        print(f"Trimmed audio duration: {trimmed_duration:.2f}s")
+
+            os.chdir(current_dir)
+            print(f"Video saved successfully to {output_path}")
+
+        except subprocess.CalledProcessError as e:
+            print("\nFFmpeg error:")
+            print("STDOUT:", e.stdout)
+            print("STDERR:", e.stderr)
+            raise
+        except FileNotFoundError:
+            print("\nError: ffmpeg not found. Please install ffmpeg to create videos.")
+            print(f"The individual frames have been saved to {output_dir}.")
+
+    @staticmethod
+    def get_sorted_images(image_dir: str, sort_method: str = 'alpha') -> List[str]:
+        """
+        Get sorted list of image paths from a directory by name, numeric, or time.
+        """
+        image_paths = glob.glob(os.path.join(image_dir, "*.jpg")) + \
+                      glob.glob(os.path.join(image_dir, "*.png"))
+        if not image_paths:
+            raise ValueError(f"No JPG/PNG images found in {image_dir}")
+
+        if sort_method == 'alpha':
+            return sorted(image_paths)
+        elif sort_method == 'numeric':
+            import re
+            def natural_keys(text):
+                return [int(c) if c.isdigit() else c.lower() for c in re.split('([0-9]+)', text)]
+            return sorted(image_paths, key=natural_keys)
+        elif sort_method == 'time':
+            return sorted(image_paths, key=lambda x: os.path.getctime(x))
+        else:
+            raise ValueError(f"Unknown sort method: {sort_method}")
+
+    @staticmethod
+    def add_frame_info(image: Image.Image, frame_number: int,
+                       images: List[Image.Image], strengths: List[float]) -> Image.Image:
+        """
+        Add frame information including source images and their strengths below the main image.
+        """
+        main_width = image.width
+        main_height = image.height
+        thumb_size = main_height // 4
+        info_height = thumb_size + 150
+
+        new_img = Image.new('RGB', (main_width, main_height + info_height), 'black')
+        new_img.paste(image, (0, 0))
+        draw = ImageDraw.Draw(new_img)
+
+        try:
+            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 72)
+            small_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 48)
+            tiny_font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 36)
+        except:
+            # Fallback if the system font is not found
+            font = ImageFont.load_default()
+            small_font = font
+            tiny_font = font
+
+        text = f"Frame {frame_number}"
+        text_bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        margin = 20
+        draw.rectangle([(margin, margin), (text_width + margin*3, text_bbox[3] + margin*2)], fill='black')
+        draw.text((margin*2, margin), text, font=font, fill='white')
+
+        # Create thumbnails
+        thumbs = []
+        for source_img in images:
+            thumb = source_img.copy()
+            thumb.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
+            thumbs.append(thumb)
+
+        spacing = 20
+        total_width = sum(thumb.width for thumb in thumbs) + spacing * (len(thumbs) - 1)
+        start_x = (main_width - total_width) // 2
+        y_pos = main_height + 20
+
+        if len(images) == 2:
+            labels = ["Current", "Next"]
+        else:
+            labels = [f"Img #{i+1}" for i in range(len(images))]
+
+        current_x = start_x
+        for i, (thumb, strength, label) in enumerate(zip(thumbs, strengths, labels)):
+            label_bbox = draw.textbbox((0, 0), label, font=tiny_font)
+            label_width = label_bbox[2] - label_bbox[0]
+            label_x = current_x + (thumb.width - label_width) // 2
+            draw.text((label_x, y_pos), label, font=tiny_font, fill='white')
+
+            new_img.paste(thumb, (current_x, y_pos + 30))
+
+            str_text = f"Strength: {strength:.3f}"
+            text_bbox = draw.textbbox((0, 0), str_text, font=small_font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_x = current_x + (thumb.width - text_width) // 2
+            text_y = y_pos + thumb.height + 40
+            draw.text((text_x, text_y), str_text, font=small_font, fill='white')
+
+            current_x += thumb.width + spacing
+
+        return new_img
+
+    @staticmethod
+    def parse_frames_list(frames_str: str) -> List[int]:
+        """
+        Parse frames string into list of frame counts.
+        Accepts either a single number or comma-separated list.
+        """
+        try:
+            parts = frames_str.split(',')
+            if len(parts) == 1:
+                return [int(parts[0])]
+            else:
+                return [int(x) for x in parts]
+        except ValueError:
+            raise ValueError("frames_per_image must be an integer or comma-separated list of integers")
+
+    @staticmethod
+    def determine_output_size(first_image_path: str, size_option: str) -> Tuple[int, int]:
+        """
+        Determine output dimensions based on first image aspect ratio and size selection.
+        Returns (width, height) tuple.
+
+        Note: Flux requires dimensions to be multiples of 8.
+        The size value represents the minimum dimension - the larger dimension
+        will be scaled proportionally while maintaining aspect ratio.
+        """
+        from PIL import Image
+
+        # Define base sizes for each option - all should be multiples of 8
+        # These values represent the MINIMUM dimension
+        SIZE_MAP = {
+            "Small (512px)": 512,    # e.g. 512x720 for 2:3
+            "Medium (720px)": 704,    # e.g. 704x1024 for 2:3
+            "Large (1024px)": 896,    # e.g. 896x1280 for 2:3
+        }
+        min_size = SIZE_MAP[size_option]
+
+        # Read first image dimensions
+        with Image.open(first_image_path) as img:
+            orig_width, orig_height = img.size
+            aspect_ratio = orig_width / orig_height
+
+        def make_multiple_of_8(dim: int) -> int:
+            """Ensure dimension is a multiple of 8"""
+            return (dim // 8) * 8
+
+        # Instead of using the aspect ratio categories, we'll now just use
+        # the aspect ratio directly to determine dimensions
+        if aspect_ratio > 1:  # Wider than tall
+            # Height becomes the minimum size
+            height = min_size
+            width = make_multiple_of_8(int(height * aspect_ratio))
+        else:  # Taller than wide or square
+            # Width becomes the minimum size
+            width = min_size
+            height = make_multiple_of_8(int(width / aspect_ratio))
+
+        return (width, height)
+
+
+#############################################################################
+# Example specialized node class updated with your 4 requirements:
+#############################################################################
+
+class FluxTravelPrecise(NodeBase):
+    """
+    A node that expects a dict with 'audioFile' and 'timestamps' keys, e.g.:
+      {
+        'audioFile': '0210.MP3',
+        'timestamps': [
+           {'id': 'j45tre29f', 'time': '174.4210', 'image': None},
+           {'id': 'disycad77', 'time': '314.8415', 'image': 'disycad77_Pantheon-Roma-dallalto.jpg'},
+           {'id': 'imal920au', 'time': '542.2481', 'image': 'imal920au_Pantheon-Roma-dallalto.jpg'}
+        ]
+      }
+
+    It will:
+      1) Drop any timestamps that have no image
+      2) Crop audio & timestamps so they begin at the first image
+      3) Pass the pruned/shifted arrays to process_timestamped_images
+      4) Then create_interpolation_video, trimming audio accordingly
+    """
+
+    def execute(self, data: Dict, fps: float, steps: int, size: str):
+        """
+        data: Dict with 'audioFile' and 'timestamps' as described
+        fps: frames per second
+        steps: diffusion steps
+        size: size option for output dimensions
+        """
+        # -----------------------
+        # 1) Drop timestamps with no image
+        # -----------------------
+        raw_list = data.get('timestamps', [])
+        # Filter out entries that have 'image': None (or empty)
+        filtered = [entry for entry in raw_list if entry.get('image')]
+
+        if not filtered:
+            raise ValueError("No timestamps have valid images!")
+
+        # -----------------------
+        # Convert times to float, sort ascending (just in case).
+        # -----------------------
+        for entry in filtered:
+            entry['time'] = float(entry['time'])
+        filtered.sort(key=lambda x: x['time'])
+
+        # -----------------------
+        # 2) Crop so the first timestamp is at t=0
+        #    If the first image is at e.g. 1.0s, we remove that from all times
+        #    and from the audio start.
+        # -----------------------
+        first_time = filtered[0]['time']
+        # Shift so first time is 0
+        for entry in filtered:
+            entry['time'] -= first_time
+
+        # We'll also set the audio start_time to `first_time`
+        audio_file = data.get('audioFile', None)
+        if audio_file:
+            audio_file = os.path.join("/data/files", audio_file)
+
+        # -----------------------
+        # Build arrays for process_timestamped_images
+        # -----------------------
+        image_paths = []
+        times = []
+        for entry in filtered:
+            # If your actual images also reside in /data/files, do:
+            img_path = os.path.join("/data/files", entry['image'])
+            image_paths.append(img_path)
+            times.append(entry['time'])
+
+        # Determine output dimensions based on first image
+        width, height = FluxTravelBase.determine_output_size(image_paths[0], size)
+
+        # -----------------------
+        # 3) Pass these to process_timestamped_images
+        # -----------------------
+        pipe, pipe_prior_redux, _ = FluxTravelBase.setup_pipeline()
+
+        print("Passing image_paths, times to process_timestamped_images:")
+        print("image_paths=", image_paths)
+        print("times=", times)
+        print(f"Output dimensions: {width}x{height}")
+
+        results, generation_times, frame_info = FluxTravelBase.process_timestamped_images(
+            image_paths=image_paths,
+            timestamps=times,
+            fps=fps,
+            pipe=pipe,
+            pipe_prior_redux=pipe_prior_redux,
+            steps=steps,
+            info_mode=False,
+            csv_only=False,
+            height=height,
+            width=width,
+            blend_amount=1.1,
+        )
+
+        # -----------------------
+        # 4) Create interpolation video
+        #    We'll trim the audio from start_time=first_time onward,
+        #    so everything lines up. We'll let end_time=None so it doesn't
+        #    forcibly cut the end of the audio.
+        # -----------------------
+        output_path = f"/data/files/{uuid.uuid4()}.mp4"
+        FluxTravelBase.create_interpolation_video(
+            results,
+            output_path=output_path,
+            fps=fps,
+            audio_path=audio_file,
+            start_time=first_time,  # This is how we crop the audio start
+            end_time=None,
+            skip_frame_save=False,
+            frame_info=frame_info,
+            resize_width=width,
+            resize_height=height
+        )
+
+        return {"output_path": output_path}
+
+
+class FluxTravelLoose(NodeBase):
+    """
+    A node that expects just a list of images (and possibly frames per image)
+    and does a simpler "loose" interpolation without strict timestamps.
+    """
+    def execute(self, images, frames_per_image, fps, sort_by, audio_file, size):
+        # If images is a directory path, call FluxTravelBase.get_sorted_images()
+        if isinstance(images, str) and os.path.isdir(images):
+            image_paths = FluxTravelBase.get_sorted_images(images, sort_method=sort_by)
+        elif isinstance(images, list):
+            image_paths = images
+        else:
+            raise ValueError("Parameter 'images' must be either a directory path or a list of file paths")
+
+        if not image_paths:
+            raise ValueError("No images found!")
+
+        # Determine output dimensions based on first image
+        width, height = FluxTravelBase.determine_output_size(image_paths[0], size)
+        print(f"Output dimensions: {width}x{height}")
+
+        # Setup pipeline
+        pipe, pipe_prior_redux, _ = FluxTravelBase.setup_pipeline()
+
+        # Convert frames_per_image to list (in case user provides multiple segments)
+        frames_list = FluxTravelBase.parse_frames_list(str(frames_per_image))
+
+        # Use the older piecewise logic
+        results, generation_times, frame_info = FluxTravelBase.process_image_batch(
+            image_paths=image_paths,
+            pipe=pipe,
+            pipe_prior_redux=pipe_prior_redux,
+            frames_per_transition=frames_list,
+            height=height,
+            width=width,
+            noise_blend_amount=0.0,
+            csv_only=False
+        )
+
+        # Create video
+        output_path = f"/data/files/{uuid.uuid4()}.mp4"
+        FluxTravelBase.create_interpolation_video(
+            results,
+            output_path=output_path,
+            fps=fps,
+            audio_path=audio_file,
+            frame_info=frame_info,
+            resize_width=width,
+            resize_height=height
+        )
+        return {"output_path": output_path}
+
+class PlayVideo(NodeBase):
+    def execute(self, video_file, video_out=None):
+        # Debug: log the received video_file value    
+        print('PlayVideo: Received video_file:', video_file)
+      
+        return {"file_to_play": video_file}
+    
+
+
+'''
+class DisplayText(NodeBase):
     def execute(self, text_in, text_in_2):
         return {"text_out": text_in + text_in_2}
+'''
 
 ================================================================================
 FILE: modules/Text/__init__.py
@@ -1131,12 +2466,13 @@ FILE: modules/Text/__init__.py
 MODULE_MAP = {
     "Text": {
         "label": "Text",
-        "description": "Text",
+        "description": "Text",    
         "category": "text",
-        "execution_type": "button",
+        "type": "tool",
+        "execution_type": "continuous",
         "params": {
             "text": {
-                "label": "Text",
+                "label": "Text (Continuous)",
                 "type": "string",
                 "display": "output",
             },
@@ -1148,28 +2484,11 @@ MODULE_MAP = {
         }
     },
     "Text2": {
-        "label": "Text2",
+        "label": "Text (Button)",
         "description": "Text",
         "category": "text",        
-        "params": {
-            "text": {
-                "label": "Text",
-                "type": "string",
-                "display": "output",
-            },
-            "text_field": {
-                "label": "Text Field",
-                "type": "string",
-                "display": "textarea",
-            }
-        }
-    },
-
-    "TextContinuous": {
-        "label": "Text (Continuous)",
-        "description": "Text that runs automatically as you type",
-        "category": "text",
-        "execution_type": "continuous",
+        "type": "tool",
+        "execution_type": "button",
         "params": {
             "text": {
                 "label": "Text",
@@ -1188,6 +2507,7 @@ MODULE_MAP = {
         "label": "Display Text",
         "description": "Display text",
         "category": "text",
+        "type": "tool",
         "params": {
             "text_in": {
                 "label": "Text Input",
@@ -1199,11 +2519,170 @@ MODULE_MAP = {
                 "type": "string",
                 "display": "input",
             },
+            
             "text_display": {
                 "label": "Text",
                 "type": "text",
                 "display": "ui",
                 "source": "text_out",
+            },
+            "video_display": {
+                "label": "Video",
+                "type": "text",
+                "display": "ui_video",                
+                "source": "video_out",
+            }
+        }
+    },
+    "Timeline": {
+        "label": "Timeline",
+        "description": "Timeline",
+        "category": "text",
+        "type": "tool",
+        "execution_type": "button",
+        "params": {
+            "audio_file": {
+                "label": "Audio File",
+                "type": "audio",
+                "display": "input",
+                },
+            "timestamps": {
+                "label": "Timestamps",
+                "type": "timeline",
+                "display": "ui_timeline",
+            },
+            "timestamps_out": {
+                "label": "Timeline",
+                "type": "timeline",
+                "source": "timestamps",
+                "display": "output",
+                
+            }
+        }
+    },
+    "LoadAudio": {
+        "label": "Load Audio",
+        "description": "Load audio",
+        "category": "text",
+        "execution_type": "button",
+        "params": {
+            "audio_file": {
+                "label": "Audio File",
+                "type": "audio",
+                "display": "filebrowser",
+            },
+            "audio_file_out": {
+                "label": "Audio File",
+                "type": "audio",
+                "display": "output",
+            }
+        }
+    },
+    "FluxTravelPrecise": {
+        "label": "Flux Travel (Precise)",
+        "description": "Flux Travel",
+        "type": "tool",
+        "category": "text",
+        "execution_type": "button",
+        "params": {
+            "timestamps": {
+                "label": "Timestamps",
+                "type": "timeline",
+                "display": "input"
+            },
+            "fps": {
+                "label": "FPS",
+                "type": "number",
+                "default": 30,                
+                'min': 1,
+                'max': 100,
+            },
+            "steps": {
+                "label": "Steps",
+                "type": "number",
+                "default": 4,                
+                'min': 1,
+                'max': 10,
+            },
+            "size": {
+                "label": "Size",
+                "type": "dropdown",
+                "options": ["Small (512px)", "Medium (720px)", "Large (1024px)"],
+                "default": "Medium (720px)",
+            },
+            "video_out": {
+                "label": "Video",
+                "type": "video",
+                "display": "output",
+            }
+        }
+    },
+    "FluxTravelLoose": {
+        "label": "Flux Travel (Loose)",
+        "description": "Flux Travel",
+        "type": "tool",
+        "category": "text",
+        "execution_type": "button",
+        "params": {
+            "images": {
+                "label": "Images",
+                "type": "image",
+                "display": "input",
+            },            
+            "audio_file": {
+                "label": "Audio File",
+                "type": "audio",
+                "display": "input",
+            },
+            "frames_per_image": {
+                "label": "Number of Frames",
+                "type": "number",
+                "default": 16,                
+                'min': 1,
+                'max': 100,
+            },
+            "fps": {
+                "label": "FPS",
+                "type": "number",
+                "default": 30,
+                'min': 1,
+                'max': 60,
+            },
+            "sort_by": {
+                "label": "Sort By",
+                "type": "dropdown",                                
+                "options": ["timestamp", "image_name"],
+            },
+            "size": {
+                "label": "Size",
+                "type": "dropdown",
+                "options": ["Small (512px)", "Medium (720px)", "Large (1024px)"],
+                "default": "Medium (720px)",
+            },
+            "video_out": {
+                "label": "Video",
+                "type": "video",
+                "display": "output",
+            }
+        }
+    },
+    "PlayVideo": {
+        "label": "Play Video",
+        "description": "Play video",
+        "type": "tool",
+        "category": "text",
+        "execution_type": "button",
+        "params": {
+            "video_file": {
+                "label": "Video File",
+                "type": "string",
+                "display": "input",
+            },
+            "video_out": {
+                "label": "Video",
+                "type": "string",                
+                "display": "ui_video",                          
+                "source": "file_to_play",
             }
         }
     }
@@ -1216,17 +2695,17 @@ FILE: client/src/App.tsx
 import { useEffect } from 'react';
 import { 
   ReactFlow,
-  //Controls,
   Background,
-  BackgroundVariant,
+  Controls,
   NodeOrigin,
-  useReactFlow,
+  Viewport,
   Connection,
-  IsValidConnection,
-  Viewport
+  Edge,
+  EdgeMouseHandler,
+  IsValidConnection
 } from '@xyflow/react';
 import { shallow } from 'zustand/shallow';
-import { useNodeState, NodeState, CustomNodeType } from './stores/nodeStore';
+import { useNodeState, NodeState, CustomNodeType, getLocalStorageKey } from './stores/nodeStore';
 import { useNodeRegistryState, NodeRegistryState } from './stores/nodeRegistryStore';
 import { useWebsocketState, WebsocketState } from './stores/websocketStore';
 
@@ -1251,6 +2730,10 @@ const selectNodeState = (state: NodeState) => ({
   onConnect: state.onConnect,
   addNode: state.addNode,
   getParam: state.getParam,
+  loadWorkflowFromStorage: state.loadWorkflowFromStorage,
+  mode: state.mode,
+  viewport: state.viewport,
+  setViewport: state.setViewport,
 });
 
 const selectNodeRegistryState = (state: NodeRegistryState) => ({
@@ -1265,33 +2748,36 @@ const selectWebsocketState = (state: WebsocketState) => ({
 const nodeOrigin: NodeOrigin = [0, 0];
 
 export default function App() {
-  const { nodes, edges, onNodesChange, onEdgesChange, onEdgeDoubleClick, onConnect, addNode, getParam } = useNodeState(selectNodeState, shallow);
+  const {
+    nodes,
+    edges,
+    onNodesChange,
+    onEdgesChange,
+    onEdgeDoubleClick,
+    onConnect,
+    addNode,
+    getParam,
+    loadWorkflowFromStorage,
+    mode,
+    viewport,
+    setViewport,
+  } = useNodeState(selectNodeState, shallow);
   const { nodeRegistry, updateNodeRegistry } = useNodeRegistryState(selectNodeRegistryState, shallow);
   const { connect: connectWebsocket } = useWebsocketState(selectWebsocketState, shallow);
-  const { screenToFlowPosition, setNodes, setEdges, setViewport } = useReactFlow();
-
-  // Load the list of available nodes
+  
   useEffect(() => {
-    const stored = localStorage.getItem('workflow');
-    if (stored) {
-      const { nodes: storedNodes, edges: storedEdges } = JSON.parse(stored);
-
-      setNodes(storedNodes || []);
-      setEdges(storedEdges || []);
-    }
-
+    // Load workflow from localStorage and initialize other services
+    loadWorkflowFromStorage();
     updateNodeRegistry();
     connectWebsocket('ws://' + config.serverAddress + '/ws');
   }, []);
 
   // Save viewport position when it changes
   const onMoveEnd = (_: MouseEvent | TouchEvent | null, viewport: Viewport) => {
-    const workflow = JSON.parse(localStorage.getItem('workflow') || '{}');
-    workflow.viewport = viewport;
-    localStorage.setItem('workflow', JSON.stringify(workflow));
+    setViewport(viewport);
   };
   
-  // TODO: probably need to use useCallback
+  // Handle drag & drop of workflow JSON
   const onWorkflowDrop = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
     const file = event.dataTransfer.files[0];
@@ -1300,111 +2786,98 @@ export default function App() {
     const reader = new FileReader();
     reader.onload = (e) => {
       const flow = JSON.parse(e.target?.result as string);
-      const { x = 0, y = 0, zoom = 1 } = flow.viewport;
-      setViewport({ x, y, zoom });
-      setNodes(flow.nodes);
-      setEdges(flow.edges);
-    };
+      // Set default type if not present
+      if (!flow.type) {
+        flow.type = 'workflow';
+      }
 
+      // Store the workflow in the appropriate localStorage key
+      const key = getLocalStorageKey(flow.type);
+      
+      // Ensure we preserve the viewport from the loaded file
+      const storedData = JSON.parse(localStorage.getItem(key) || '{}');
+      const newData = {
+        ...flow,
+        viewport: flow.viewport || storedData.viewport
+      };
+      localStorage.setItem(key, JSON.stringify(newData));
+      
+      // Now load it through the store which will handle setting the mode
+      loadWorkflowFromStorage(flow.type);
+    };
     reader.readAsText(file);
   };
 
   // Handle drag and drop
   const onDragOver = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
-
-    if (event.dataTransfer.types.includes('Files')) {
-      event.dataTransfer.dropEffect = 'copy';
-      return;
-    }
     event.dataTransfer.dropEffect = 'move';
-  }
+  };
 
   const onDrop = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
 
-    // Handle workflow file drops
+    // Handle workflow JSON file drop
     if (event.dataTransfer.files.length > 0) {
       onWorkflowDrop(event);
       return;
     }
 
-    if (!nodeRegistry) return;
+    // Handle node drop
+    const nodeKey = event.dataTransfer.getData('text/plain');
+    if (!nodeKey || !nodeRegistry[nodeKey]) return;
 
-    const key = event.dataTransfer.getData('text/plain');
-    if (!key || !nodeRegistry[key]) return;
+    const node = nodeRegistry[nodeKey];
 
-    const nodeData = nodeRegistry[key];
-
-    const position = screenToFlowPosition({
-      x: event.clientX,
-      y: event.clientY,
-    });
-
-    const newNode = {
-      id: nanoid(),
-      type: 'custom', // for now we only have custom type
-      position,
-      data: nodeData,
+    // Get the position of the drop
+    const reactFlowBounds = event.currentTarget.getBoundingClientRect();
+    const position = {
+      x: event.clientX - reactFlowBounds.left,
+      y: event.clientY - reactFlowBounds.top,
     };
 
-    addNode(newNode as CustomNodeType);
-  }
+    addNode({
+      id: nodeKey + '-' + Math.random().toString(36).substr(2, 9),
+      type: 'custom',
+      position,
+      data: {
+        ...node,
+        execution_type: node.execution_type ?? 'workflow',  // Ensure execution_type is always defined
+        params: node.params ?? {},  // Ensure params is always defined
+      },
+    });
+  };
 
   const isValidConnection = (connection: Connection) => {
-    if (!connection.sourceHandle || !connection.targetHandle) return false;
-
-    // prevent self-loops
-    if (connection.source === connection.target) return false;
-
-    let sourceType = getParam(connection.source, connection.sourceHandle, 'type');
-    let targetType = getParam(connection.target, connection.targetHandle, 'type');
-    sourceType = Array.isArray(sourceType) ? sourceType : [sourceType];
-    sourceType.push('any');
-    targetType = Array.isArray(targetType) ? targetType : [targetType];
-
-    if (!sourceType.some((type: string) => targetType.includes(type))) return false;
-
     return true;
-  }
+  };
 
-  // Get stored viewport or use defaults
-  const defaultViewport = (() => {
-    const stored = localStorage.getItem('workflow');
-    if (stored) {
-      const { viewport } = JSON.parse(stored);
-      if (viewport) {
-        return viewport;
-      }
-    }
-    return { x: 0, y: 0, zoom: 1 };
-  })();
+  const handleEdgeDoubleClick: EdgeMouseHandler = (event, edge) => {
+    onEdgeDoubleClick(edge.id);
+  };
 
   return (
     <ReactFlow
       nodes={nodes}
       edges={edges}
-      nodeTypes={nodeTypes}
       onNodesChange={onNodesChange}
       onEdgesChange={onEdgesChange}
-      onEdgeDoubleClick={(_, edge) => onEdgeDoubleClick(edge.id)}
-      isValidConnection={isValidConnection as IsValidConnection}
+      onEdgeDoubleClick={handleEdgeDoubleClick}
       onConnect={onConnect}
-      nodeOrigin={nodeOrigin}
-      onDragOver={onDragOver}
       onDrop={onDrop}
+      onDragOver={onDragOver}
       onMoveEnd={onMoveEnd}
-      edgesReconnectable={true}
-      defaultViewport={defaultViewport}
+      isValidConnection={isValidConnection as IsValidConnection}
+      nodeTypes={nodeTypes}
+      nodeOrigin={nodeOrigin}
+      viewport={viewport}
+      fitView={!viewport}
       minZoom={0.1}
-      maxZoom={1.2}
-      //connectionRadius={18}
-      //fitView
-      proOptions={{hideAttribution: true}}
-      deleteKeyCode={['Backspace', 'Delete']}      
+      maxZoom={2}
+      proOptions={{ hideAttribution: true }}
     >
-      {/* <Controls position="bottom-right" /> */}
-      <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="rgba(255, 255, 255, 0.3)" />
+      <Background />
+      <Controls />
     </ReactFlow>
   );
 }
@@ -1416,58 +2889,35 @@ FILE: client/src/main.tsx
 
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import {ReactFlowProvider } from '@xyflow/react'
+import { ReactFlowProvider } from '@xyflow/react'
 
 import { createTheme, ThemeProvider } from '@mui/material/styles';
 import CssBaseline from '@mui/material/CssBaseline';
 import "@fontsource/jetbrains-mono/latin-400.css";
 import "@fontsource/jetbrains-mono/latin-700.css";
+import "@fontsource/inter/latin-400.css";
+import "@fontsource/inter/latin-500.css";
+import "@fontsource/inter/latin-600.css";
 
 import { WebSocketProvider } from './components/WebsocketContext';
-
-const themeOptions = createTheme({
-  components: {
-    MuiAccordionSummary: {
-      styleOverrides: {
-        root: {
-          fontFamily: 'JetBrains Mono',
-        },
-      },
-    },
-  },
-  palette: {
-    mode: 'dark',
-    primary: {
-      main: '#ffb300',
-    },
-    secondary: {
-      main: '#00695f',
-    },
-    background: {
-      default: '#121212',
-      paper: '#1a1a1a',
-    },
-  },
-  typography: {
-    fontSize: 14,
-    fontFamily: 'JetBrains Mono',
-  },
-  /* Disable all transitions
-  transitions: {
-    create: () => 'none',
-  }
-  */
-});
+import { useNodeState } from './stores/nodeStore';
+import { shallow } from 'zustand/shallow';
+import { getThemeOptions } from './theme/themeConfig';
+import { ThemeInjector } from './theme/ThemeInjector';
 
 import App from './App.tsx'
 import Box from '@mui/material/Box';
 import ToolBar from './components/ToolBar.tsx';
 import ActionBar from './components/ActionBar.tsx';
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <ThemeProvider theme={themeOptions}>
+function ThemedApp() {
+  const { mode } = useNodeState(state => ({ mode: state.mode }), shallow);
+  const theme = createTheme(getThemeOptions(mode));
+
+  return (
+    <ThemeProvider theme={theme}>
       <CssBaseline />
+      <ThemeInjector />
       <ReactFlowProvider>
         <Box sx={{
           display: 'flex',
@@ -1493,774 +2943,14 @@ createRoot(document.getElementById('root')!).render(
         </Box>
       </ReactFlowProvider>
     </ThemeProvider>
+  );
+}
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <ThemedApp />
   </StrictMode>
 )
-
-
-================================================================================
-FILE: client/src/stores/nodeRegistryStore.ts
-================================================================================
-
-import { createWithEqualityFn } from 'zustand/traditional';
-import config from '../../config';
-
-type NodeType = {
-    [key: string]: {
-        label: string
-        module: string
-        action: string
-        category: string
-        params?: { [key: string]: any }
-    }
-}
-
-export type NodeRegistryState = {
-    nodeRegistry: NodeType;
-    updateNodeRegistry: () => Promise<void>;
-}
-
-export const useNodeRegistryState = createWithEqualityFn<NodeRegistryState>((set) => ({
-    nodeRegistry: {},
-    updateNodeRegistry: async () => {
-        try {
-            const response = await fetch('http://' + config.serverAddress + '/nodes')
-            const data = await response.json()
-            set({ nodeRegistry: data })
-        } catch (error) {
-            console.error('Can\'t connect to route `/nodes`', error)
-        }
-    },
-}))
-
-================================================================================
-FILE: client/src/stores/nodeStore.ts
-================================================================================
-
-import {
-    Edge,
-    Node,
-    OnConnect,
-    NodeChange,
-    EdgeChange,
-    OnNodesChange,
-    OnEdgesChange,
-    applyNodeChanges,
-    applyEdgeChanges,
-    Connection,
-    getOutgoers,
-    getIncomers,
-} from '@xyflow/react';
-import { createWithEqualityFn } from 'zustand/traditional';
-import { nanoid } from 'nanoid';
-import { useWebsocketState } from './websocketStore';
-
-import config from '../../config';
-
-export type GroupParams = {
-    key: string;
-    display: 'group' | 'collapse';
-    label?: string | null;
-    hidden?: boolean;
-    disabled?: boolean;
-    open?: boolean;
-    direction?: 'row' | 'column';
-}
-
-export type NodeParams = {
-    type?: string | string[];
-    label?: string;
-    display?: string;
-    value?: any;
-    spawn?: boolean;
-    options?: any;
-    default?: any;
-    description?: string;
-    source?: string;
-    min?: number;
-    max?: number;
-    step?: number;
-    group?: GroupParams;
-    style?: { [key: string]: string };
-    no_validation?: boolean;
-    disabled?: boolean;
-    hidden?: boolean;
-    onChange?: any;
-    icon?: string;
-};
-
-type NodeData = {
-    module: string;
-    action: string;
-    category: string;
-    execution_type: 'workflow' | 'button' | 'continuous';
-    params: { [key: string]: NodeParams };
-    cache?: boolean;
-    time?: number;
-    memory?: number;
-    label?: string;
-    description?: string;
-    resizable?: boolean;
-    groups?: { [key: string]: { disabled?: boolean, hidden?: boolean, open?: boolean } };
-    style?: { [key: string]: string };
-};
-
-type StoredWorkflow = {
-    nodes: CustomNodeType[];
-    edges: Edge[];
-    viewport?: { x: number; y: number; zoom: number };
-  };
-
-export type CustomNodeType = Node<NodeData, 'custom'>;
-
-// Data format for API export
-type APINodeData = {
-    // TODO: we also need a workflow id probably
-    module: string;
-    action: string;
-    params: {
-        [key: string]: {
-            sourceId?: string,
-            sourceKey?: string,
-            value?: any,
-            display?: string,
-            type?: string | string[]
-        }
-    };
-};
-
-type GraphExport = {
-    sid: string;
-    nodes: { [key: string]: APINodeData };
-    paths: string[][];
-};
-
-const formatAPIData = (node: CustomNodeType, edge: Edge[]): APINodeData => {
-    const inputEdges = edge.filter(e => e.target === node.id);
-    const params: APINodeData['params'] = {};
-
-    Object.entries(node.data.params).forEach(([key, param]) => {
-        // We don't need to export output parameters
-        if (param.display === 'output') {
-            return;
-        }
-
-        const edge = inputEdges.find(e => e.targetHandle === key);
-
-        params[key] = {
-            sourceId: edge?.source ?? undefined,
-            sourceKey: (edge ? edge.sourceHandle : param.source) ?? undefined,
-            value: param.value ?? undefined,
-            display: param.display ?? undefined,
-            type: param.type ?? undefined
-        };
-    });
-
-    return {
-        module: node.data.module,
-        action: node.data.action,
-        params
-    };
-};
-
-/*
-const findOutputNode = (nodes: CustomNodeType[], edges: Edge[]): CustomNodeType[] => {
-    const outputNodes = new Set(edges.map(edge => edge.source));
-    return nodes.filter(node => !outputNodes.has(node.id));
-};
-*/
-
-const buildPath = (
-    currentNode: string,
-    nodes: CustomNodeType[],
-    edges: Edge[],
-    visited: Set<string> = new Set()
-): string[] => {
-    if (visited.has(currentNode)) return []; // Prevent cycles
-    visited.add(currentNode);
-
-    // Get all incoming edges to this node
-    //const incomingEdges = edges.filter(edge => edge.target === currentNode);
-    const node = nodes.find(n => n.id === currentNode);
-    if (!node) return [];
-    
-    const incomingNodes = getIncomers(node, nodes, edges);
-
-    // If this is an input node (no incoming edges), return just this node
-    if (incomingNodes.length === 0) {
-        return [currentNode];
-    }
-
-    const inputPaths = incomingNodes.flatMap(sourceNode =>
-        buildPath(sourceNode.id, nodes, edges, new Set(visited))
-    );
-
-    return [...inputPaths, currentNode];
-};
-
-export type NodeState = {
-    nodes: CustomNodeType[];
-    edges: Edge[];
-    onNodesChange: OnNodesChange<CustomNodeType>;
-    onEdgesChange: OnEdgesChange;
-    onEdgeDoubleClick: (id: string) => void;
-    onConnect: OnConnect;
-    addNode: (node: CustomNodeType) => void;
-    setParamValue: (id: string, key: string, value: any) => void;
-    setParam: (id: string, param: string, value: any, key?: keyof NodeParams) => void;
-    getParam: (id: string, param: string, key: keyof NodeParams) => any;
-    setNodeExecuted: (id: string, cache: boolean, time: number, memory: number) => void;
-    exportGraph: (sid: string) => GraphExport;
-    updateLocalStorage: () => void;
-    runSubGraph: (sid: string, nodeId: string) => Promise<void>;
-};
-
-export const useNodeState = createWithEqualityFn<NodeState>((set, get) => ({
-    nodes: JSON.parse(localStorage.getItem('workflow') || '{"nodes":[]}').nodes || [],
-    edges: JSON.parse(localStorage.getItem('workflow') || '{"edges":[]}').edges || [],
-
-    onNodesChange: async (changes: NodeChange<CustomNodeType>[]) => {
-        const newNodes = applyNodeChanges(changes, get().nodes);
-        set({ nodes: newNodes });
-
-        // Save to localStorage after changes
-        const stored = localStorage.getItem('workflow');
-        const { viewport } = stored ? JSON.parse(stored) : { viewport: { x: 0, y: 0, zoom: 1 } };
-        const workflow: StoredWorkflow = { nodes: newNodes, edges: get().edges, viewport };
-        localStorage.setItem('workflow', JSON.stringify(workflow));
-        
-        // delete the server cache for the deleted nodes
-        if (changes.some(change => change.type === 'remove')) {
-            // Create an array of node ids to delete
-            const nodeIds = changes.filter(change => change.type === 'remove').map(change => change.id);
-            
-            try {
-                await fetch('http://' + config.serverAddress + '/clearNodeCache', {
-                    method: 'DELETE',
-                    body: JSON.stringify({ nodeId: nodeIds }),
-                });
-            } catch (error) {
-                console.error('Can\'t connect to server to clear cache:', error);
-                // TODO: should we retry?
-            }
-        }
-    },
-    onEdgesChange: (changes: EdgeChange<Edge>[]) => {
-        const newEdges = applyEdgeChanges(changes, get().edges);
-
-        // Handle array disconnections
-        const removedEdges = changes.filter(change => change.type === 'remove');
-        for (const removedEdge of removedEdges) {
-            const edge = get().edges.find(e => e.id === removedEdge.id);
-            const spawnHandle = get().getParam(edge?.target!, edge?.targetHandle!, 'spawn');
-            if (edge && spawnHandle) {
-                const targetNode = get().nodes.find(n => n.id === edge.target);
-                if (targetNode) {
-                    // Remove the specific parameter that was disconnected
-                    set({
-                        nodes: get().nodes.map(node => {
-                            if (node.id === edge.target) {
-                                const { [edge.targetHandle!]: _, ...remainingParams } = node.data.params;
-                                return {
-                                    ...node,
-                                    data: {
-                                        ...node.data,
-                                        params: remainingParams
-                                    }
-                                };
-                            }
-                            return node;
-                        })
-                    });
-                }
-            }
-        }
-
-        set({ edges: newEdges });
-        get().updateLocalStorage();
-    },
-    onEdgeDoubleClick: (id: string) => {
-        const edgeChange: EdgeChange = {
-            id,
-            type: 'remove'
-        };
-        
-        // Use the existing onEdgesChange handler to process the removal
-        get().onEdgesChange([edgeChange]);
-    },
-    onConnect: (conn: Connection) => {
-        const updatedEdges = get().edges.filter(
-            edge => !(edge.target === conn.target && edge.targetHandle === conn.targetHandle)
-        );
-
-        // find the color of the target handle
-        const targetHandleEl = document.getElementById(conn.target)?.querySelector(`[data-key="${conn.targetHandle}"] .react-flow__handle`);
-        const backgroundColor = targetHandleEl ? window.getComputedStyle(targetHandleEl).backgroundColor : '#aaaaaa';
-        const newEdge = { ...conn, id: nanoid(), style: { stroke: backgroundColor } };
-        const newEdges = [...updatedEdges, newEdge];
-        const spawnHandle = get().getParam(conn.target, conn.targetHandle!, 'spawn');
-
-        // Check if this connection is replacing an existing one
-        const isReconnection = get().edges.some(
-            edge => edge.target === conn.target && edge.targetHandle === conn.targetHandle
-        );
-
-        // Handle array connections
-        if (spawnHandle && !isReconnection) {
-            const targetNode = get().nodes.find(n => n.id === conn.target);
-            if (targetNode) {
-                const baseParamKey = conn.targetHandle!.replace(/(\[\d*\])?$/, '');
-                const arrayParams = Object.keys(targetNode.data.params)
-                    .filter(k => k.startsWith(baseParamKey));
-
-                // we can spawn maximum 32 array parameters
-                if (arrayParams.length > 32) {
-                    return;
-                }
-
-                // find the biggest index of the array params
-                const nextIndex = Math.max(...arrayParams.map(k => {
-                    const match = k.match(/\[\d*\]$/);
-                    return match ? parseInt(match[0].replace('[', '').replace(']', '') || '0') : 0;
-                }));
-                const newParamKey = `${baseParamKey}[${nextIndex + 1}]`;
-
-                // Clone the base parameter
-                const baseParam = targetNode.data.params[conn.targetHandle!];
-
-                // Reorder parameters to keep array fields together
-                const orderedParams: { [key: string]: NodeParams } = {};
-                Object.entries(targetNode.data.params).forEach(([key, value]) => {
-                    orderedParams[key] = value;
-                    // Insert the new parameter right after finding an array parameter of the same type
-                    if (key === conn.targetHandle) {
-                        orderedParams[newParamKey] = { ...baseParam };
-                    }
-                });
-
-                set({
-                    nodes: get().nodes.map(node => {
-                        if (node.id === conn.target) {
-                            return {
-                                ...node,
-                                data: {
-                                    ...node.data,
-                                    params: orderedParams
-                                }
-                            };
-                        }
-                        return node;
-                    })
-                });
-            }
-        }
-
-        set({ edges: newEdges });
-        get().updateLocalStorage();
-    },
-    addNode: (node: CustomNodeType) => {
-        //const newNode = { ...node, dragHandle: 'header' };
-
-        // Set initial value for all parameters, TODO: needed? default value should be exported by the server
-        if (node.data?.params) {
-            Object.keys(node.data.params).forEach(key => {
-                const param = node.data.params[key];
-                node.data.params[key] = {
-                    ...param,
-                    value: param.value ?? param.default
-                };
-            });
-        }
-        const newNodes = [...get().nodes, node];
-        set({ nodes: newNodes });
-
-        // Save to localStorage after changes
-        const workflow: StoredWorkflow = { nodes: newNodes, edges: get().edges };
-        localStorage.setItem('workflow', JSON.stringify(workflow));
-    },
-    setParamValue: (id: string, key: string, value: any) => {
-        set({
-            nodes: get().nodes.map((node) => (
-                node.id === id
-                ? {
-                    ...node,
-                    data: {
-                        ...node.data,
-                        params: {
-                            ...node.data.params,
-                            [key]: {
-                                ...node.data.params[key],
-                                value: value
-                            }
-                        }
-                    }
-                }
-                : node
-            ))
-        });
-
-        // Keep localStorage in sync
-        get().updateLocalStorage();
-
-        // If this node is continuous, call runSubGraph
-        const node = get().nodes.find((n) => n.id === id);
-        if (node?.data.execution_type === 'continuous') {
-            const { sid } = useWebsocketState.getState();
-            if (sid) {
-                // partial-run the subgraph that includes this node
-                get().runSubGraph(sid, id);
-            }
-        }
-    },
-    updateLocalStorage: () => {
-        const stored = localStorage.getItem('workflow');
-        const { viewport } = stored ? JSON.parse(stored) : { viewport: { x: 0, y: 0, zoom: 1 } };
-        const workflow: StoredWorkflow = { nodes: get().nodes, edges: get().edges, viewport };
-        localStorage.setItem('workflow', JSON.stringify(workflow));
-    },
-    setParam: (id: string, param: string, value: any, key?: keyof NodeParams) => {
-        const k = key ?? 'value';
-
-        if (k !== 'group') {
-            set({
-                nodes: get().nodes.map((node) => (
-                    node.id === id
-                    ? {
-                        ...node,
-                        data: {
-                            ...node.data,
-                            params: {
-                                ...node.data.params,
-                                [param]: {
-                                    ...node.data.params[param],
-                                    [k]: value
-                                }
-                            }
-                        }
-                    }
-                    : node
-                )) // is this real life?
-            });
-        } else {
-            set({
-                nodes: get().nodes.map((node) => (
-                    node.id === id
-                    ? { ...node, data: { ...node.data, groups: { ...node.data.groups, [param]: { ...node.data.groups?.[param], ...value } } } }
-                    : node
-                ))
-            });
-        }
-
-        get().updateLocalStorage();
-    },
-    getParam: (id: string, param: string, key: keyof NodeParams) => {
-        const node = get().nodes.find(n => n.id === id);
-        return node?.data.params[param][key];
-    },
-    setNodeExecuted: (id: string, cache: boolean, time: number, memory: number) => {
-        set({ nodes: get().nodes.map(node => (node.id === id ? { ...node, data: { ...node.data, cache, time, memory } } : node)) });
-    },
-    exportGraph: (sid: string) => {
-        const { nodes, edges } = get();
-        const outputNodes = nodes.filter(node => getOutgoers(node, nodes, edges).length === 0); //findOutputNode(nodes, edges);
-        const paths = outputNodes.map(node => buildPath(node.id, nodes, edges));
-
-        const nodesLookup = nodes.reduce((acc, node) => ({
-            ...acc,
-            [node.id]: formatAPIData(node, edges)
-        }), {});
-
-        const graphData: GraphExport = {
-            sid: sid ?? '',
-            nodes: nodesLookup,
-            paths
-        };
-
-        return graphData;
-    },
-    runSubGraph: async (sid: string, nodeId: string) => {
-        const { nodes, edges } = get();
-        
-        // Start from the triggering node and find all paths to outputs
-        const allPaths: string[][] = [];
-        const visited = new Set<string>();
-        
-        const buildForwardPath = (currentId: string, currentPath: string[] = []): void => {
-            if (visited.has(currentId)) return;
-            visited.add(currentId);
-            
-            const newPath = [...currentPath, currentId];
-            const node = nodes.find(n => n.id === currentId);
-            if (!node) return;
-            
-            const outgoers = getOutgoers(node, nodes, edges);
-            
-            // If this is an output node (no outgoers), add the path
-            if (outgoers.length === 0) {
-                allPaths.push(newPath);
-            }
-            
-            // Continue building paths through outgoing nodes
-            outgoers.forEach(outNode => {
-                buildForwardPath(outNode.id, newPath);
-            });
-        };
-
-        // Build all forward paths starting from our node
-        buildForwardPath(nodeId);
-        
-        // If no downstream paths found, just run this node
-        if (allPaths.length === 0) {
-            allPaths.push([nodeId]);
-        }
-
-        // Format nodes just like exportGraph does
-        const nodesLookup = nodes.reduce((acc, node) => ({
-            ...acc,
-            [node.id]: formatAPIData(node, edges)
-        }), {});
-
-        // Create and send the sub-graph
-        const subGraph = {
-            sid,
-            nodes: nodesLookup,
-            paths: allPaths
-        };
-
-        try {
-            await fetch('http://' + config.serverAddress + '/graph', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(subGraph),
-            });
-        } catch (error) {
-            console.error('Error connecting to API server:', error);
-        }
-    }
-}));
-
-
-================================================================================
-FILE: client/src/stores/websocketStore.ts
-================================================================================
-
-import { createWithEqualityFn } from 'zustand/traditional';
-import { useNodeState } from './nodeStore';
-import { nanoid } from 'nanoid';
-
-/*
-const selectNodeState = (state: NodeState) => ({
-    nodes: state.nodes,
-    setParamValue: state.setParamValue,
-});
-*/
-type NodeProgress = {
-    value: number;
-    type: 'determinate' | 'indeterminate' | 'disabled';
-};
-
-export type WebsocketState = {
-    address: string | null;
-    sid: string | null;
-    socket: WebSocket | null;
-    isConnected: boolean;
-    reconnectTimer: NodeJS.Timeout | undefined;
-
-    connect: (addr?: string) => void;
-    disconnect: () => void;
-
-    threeData: Record<string, string>;
-    updateThreeData: (nodeId: string, key: string, value: string) => void;
-
-    nodeProgress: Record<string, NodeProgress>;
-    updateNodeProgress: (nodeId: string, progress: number) => void;
-}
-
-export const useWebsocketState = createWithEqualityFn<WebsocketState>((set, get) => ({
-    address: null,
-    sid: null,
-    socket: null,
-    isConnected: false,
-    reconnectTimer: undefined,
-
-    nodeProgress: {},
-    updateNodeProgress: (nodeId: string, progress: number) => {
-        set((state) => ({
-            nodeProgress: {
-                ...state.nodeProgress,
-                [nodeId]: {
-                    value: progress < 0 ? 0 : progress,
-                    type: progress === -1 ? 'indeterminate' : progress === -2 ? 'disabled' : 'determinate'
-                }
-            }
-        }));
-    },
-
-    threeData: {},
-    updateThreeData: (nodeId: string, key: string, value: string) => {
-        set((state) => ({
-            threeData: {
-                ...state.threeData,
-                [`${nodeId}-${key}`]: value
-            }
-        }));
-    },
-
-    connect: async (addr?: string) => {
-        const { reconnectTimer } = get();
-        if (reconnectTimer) {
-            clearTimeout(reconnectTimer);
-            set({ reconnectTimer: undefined });
-        }
-    
-        let { address, sid, socket } = get();
-
-        if (socket) {
-            console.info('WebSocket already created.');
-            return;
-        }
-
-        if (!address && !addr) {
-            console.error('Cannot connect to WebSocket. No address specified.');
-            return;
-        }
-
-        if (addr && addr !== address) {
-            address = addr;
-            set({ address });
-        }
-
-        if (!sid) {
-            sid = nanoid(10);
-            set({ sid });
-        }
-
-        socket = new WebSocket(`${address}?sid=${sid}`);
-        set({ socket });
-
-        const onOpen = () => {
-            set({ isConnected: true, reconnectTimer: undefined });
-            console.info('WebSocket connection established');
-        };
-
-        const onClose = () => {
-            clearTimeout(get().reconnectTimer); // just to be sure
-            set({ socket: null, isConnected: false, reconnectTimer: undefined });
-            console.info('WebSocket connection closed');
-
-            const timer = setTimeout(() => {
-                console.info('Trying to reconnect...');
-                get().connect();
-            }, 500);
-
-            set({ reconnectTimer: timer });
-        };
-
-        const onMessage = (event: MessageEvent) => {
-            //const { setNodeExecuted } = useNodeState((state: NodeState) => ({ setNodeExecuted: state.setNodeExecuted }), shallow);
-            const message = JSON.parse(event.data);
-
-            if (message.type === 'welcome') {
-                if (!message.sid) {
-                    console.error('Invalid welcome message.');
-                    return;
-                }
-                if (message.sid !== sid) {
-                    console.info('Session ID mismatch. Updating.', message.sid, sid);
-                    set({ sid: message.sid });
-                }
-                console.info('WebSocket connection established');
-            }
-            else if (message.type === 'progress') {
-                if (!message.progress || !message.nodeId ) {
-                    return;
-                }
-                get().updateNodeProgress(message.nodeId, message.progress);
-            }
-            else if (message.type === 'image') {
-                if (!message.nodeId || !message.key || !message.data) {
-                    console.error('Invalid image message. Ignoring.');
-                    return;
-                }
-                useNodeState.getState().setParam(message.nodeId, message.key, message.data);
-            }
-            else if (message.type === '3d') {
-                if (!message.nodeId || !message.key) {
-                    console.error('Invalid 3D model message. Ignoring.');
-                    return;
-                }
-                const data = message.data || { url: null };
-                useNodeState.getState().setParam(message.nodeId, message.key, data);
-
-                // For blob data
-                // const blob = new Blob([message.data], { type: 'model/gltf-binary' });
-                // const url = URL.createObjectURL(blob);
-                // el.setAttribute('url', url);
-            }
-            else if (message.type === 'text') {
-                if (!message.nodeId || !message.key || !message.data) {
-                    console.error('Invalid text message. Ignoring.');
-                    return;
-                }
-                useNodeState.getState().setParam(message.nodeId, message.key, message.data);
-            }
-            else if (message.type === 'executed') {
-                console.info('executed', message);
-                if (!message.nodeId) {
-                    console.error('Invalid executed message. Ignoring.');
-                    return;
-                }
-                useNodeState.getState().setNodeExecuted(message.nodeId, true, message.time || 0, message.memory || 0);
-                get().updateNodeProgress(message.nodeId, -2);
-
-                // if ('updateValues' in message) {
-                //     Object.entries(message.updateValues).forEach(([k, v]) => {
-                //         useNodeState.getState().setParamValue(message.nodeId, k, v);
-                //     });
-                // }
-            }
-            else if (message.type === 'updateValues') {
-                if (!message.nodeId || !message.key || !message.value) {
-                    console.error('Invalid updateValues message. Ignoring.');
-                    return;
-                }
-                useNodeState.getState().setParamValue(message.nodeId, message.key, message.value);
-            }
-            else if (message.type === 'error') {
-                console.error('Error:', message.error);
-                set({ nodeProgress: {} });
-            }
-        };
-
-        //const onError = (event: Event) => {
-        //    console.error('WebSocket error:', event);
-        //};
-
-        socket.addEventListener('open', onOpen);
-        socket.addEventListener('close', onClose);
-        socket.addEventListener('message', onMessage);
-        //socket.addEventListener('error', onError);
-    },
-    disconnect: async () => {
-        const { reconnectTimer } = get();
-        if (reconnectTimer) {
-            clearTimeout(reconnectTimer);
-        }
-        set((state) => {
-            if (state.socket) {
-                state.socket.close();
-            }
-            return ({
-                socket: null,
-                isConnected: false,
-                reconnectTimer: undefined,
-            });
-        });
-    },
-    destroy: async () => {
-        get().disconnect();
-        set({ address: null, sid: null });
-    },
-}))
 
 
 ================================================================================
@@ -2274,9 +2964,6 @@ import Box from '@mui/material/Box'
 import Typography from '@mui/material/Typography'
 import Button from '@mui/material/Button'
 import Stack from '@mui/material/Stack'
-//import IconButton from '@mui/material/IconButton'
-
-//import WifiIcon from '@mui/icons-material/Wifi';
 import { shallow } from 'zustand/shallow'
 import { NodeState, useNodeState } from '../stores/nodeStore'
 import { WebsocketState, useWebsocketState } from '../stores/websocketStore'
@@ -2291,8 +2978,15 @@ import SvgIcon from '@mui/material/SvgIcon'
 export default function AppToolbar() {
   const { setNodes, setEdges, toObject, setViewport } = useReactFlow();
   const theme = useTheme()
-  const { exportGraph } = useNodeState((state: NodeState) => ({ exportGraph: state.exportGraph }), shallow);
+  const { exportGraph, mode } = useNodeState(
+    (state: NodeState) => ({ 
+      exportGraph: state.exportGraph,
+      mode: state.mode,
+    }), 
+    shallow
+  );
   const { sid, isConnected } = useWebsocketState((state: WebsocketState) => ({ sid: state.sid, isConnected: state.isConnected }), shallow);
+
   const onRun = async () => {
     if (!isConnected) {
       console.error('Not connected to WebSocket server');
@@ -2318,32 +3012,42 @@ export default function AppToolbar() {
 
   const onExport = useCallback(() => {
     const flow = toObject();
-    const jsonString = JSON.stringify(flow, null, 2);
+    const jsonString = JSON.stringify({
+      ...flow,
+      type: mode
+    }, null, 2);
 
     // Create blob and download
     const blob = new Blob([jsonString], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'workflow.json';
+    
+    // For tools, include the date in the filename
+    const filename = mode === 'workflow' 
+      ? 'workflow.json'
+      : `tool-${new Date().toISOString().split('T')[0]}.json`;
+      
+    link.download = filename;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
-  }, [toObject]);
+  }, [toObject, mode]);
 
   const onNew = useCallback(() => {
     // Clear the nodes and edges
     setNodes([]);
     setEdges([]);
     
-    // Clear localStorage
-    localStorage.removeItem('workflow');
+    // Clear localStorage for current mode
+    const key = mode === 'workflow' ? 'workflow' : 'tool';
+    localStorage.removeItem(key);
     
     const defaultViewport = { x: 0, y: 0, zoom: 1 };
-    localStorage.setItem('workflow', JSON.stringify({ nodes: [], edges: [], viewport: defaultViewport }));
+    localStorage.setItem(key, JSON.stringify({ type: mode, nodes: [], edges: [], viewport: defaultViewport }));
     setViewport(defaultViewport);
-  }, [setNodes, setEdges]);
+  }, [setNodes, setEdges, mode]);
 
   return (
     <Box sx={{
@@ -2376,11 +3080,11 @@ export default function AppToolbar() {
           </Box>
 
           <Box>
-          <Button
+            <Button
               variant="text"
               startIcon={<InsertDriveFileOutlinedIcon />}
               onClick={onNew}
-              sx={{ mr: 1 }}  // Add margin between buttons
+              sx={{ mr: 1 }}
             >
               New
             </Button>
@@ -2393,23 +3097,25 @@ export default function AppToolbar() {
             </Button>
           </Box>
         </Stack>
+
         <Box>
-          <Button
-            variant="contained"
-            startIcon={<PlayArrowIcon />}
-            onClick={onRun}
-            disabled={!isConnected}
-            
-            sx={{
-              background: `linear-gradient(100deg, ${theme.palette.primary.main} 25%, #ff4259 90%)`,
-              '&.Mui-disabled': {
-                background: `linear-gradient(100deg, #6a6a6a, #303030)`,
-                color: '#1a1a1a',
-              }
-            }}
-          >
-            Run
-          </Button>
+          {mode === 'workflow' && (
+            <Button
+              variant="contained"
+              startIcon={<PlayArrowIcon />}
+              onClick={onRun}
+              disabled={!isConnected}
+              sx={{
+                background: `linear-gradient(100deg, ${theme.palette.primary.main} 25%, #ff4259 90%)`,
+                '&.Mui-disabled': {
+                  background: `linear-gradient(100deg, #6a6a6a, #303030)`,
+                  color: '#1a1a1a',
+                }
+              }}
+            >
+              Run
+            </Button>
+          )}
         </Box>
         <Box></Box>
       </Stack>
@@ -2535,14 +3241,15 @@ const CustomNode = memo((props: NodeProps<CustomNodeType>) => {
             <Box
                 component="header"
                 sx={{
-                    color: theme.palette.common.white,
+                    color: theme.palette.text.primary,
                     padding: 1,
                     borderTopWidth: '6px',
                     borderTopStyle: 'solid',
-                    borderTopColor: 'rgba(0, 0, 0)',
-                    backgroundColor: theme.palette.background.default,
+                    borderTopColor: theme.palette.primary.main,
+                    backgroundColor: theme.palette.background.paper,
                     fontSize: '16px',
-                    textShadow: '0px 2px 0px rgba(0, 0, 0, 0.75)',
+                    fontWeight: 500,
+                    borderBottom: `1px solid ${theme.palette.divider}`,
                 }}
             >
                 {nodeTitle}
@@ -3075,6 +3782,8 @@ import UIImageField from "./fields/UIImageField";
 import UIThreeField from "./fields/UIThreeField";
 import FileBrowserField from "./fields/FileBrowserField";
 import UITextField from "./fields/UITextField";
+import PomsSimpleTimeline from "./fields/PomsSimpleTimeline";
+import UIVideoPlayer from "./fields/UIVideoPlayer";
 
 // These are the props sent to the fields
 export type FieldProps = {
@@ -3094,6 +3803,7 @@ export type FieldProps = {
     max?: number;
     step?: number;
     source?: string;
+    fileType?: 'image' | 'audio' | 'video' | 'text' | 'any';
     updateStore?: (param: string, value: any, key?: keyof NodeParams) => void;
     onChangeAction?: { action: string, target?: any };
 }
@@ -3126,6 +3836,16 @@ const NodeContent = (props: NodeContentProps) => {
         const sxStyle = data.style || {};
         const label = data.label || key;
         
+        // Log when we're rendering a timeline field
+        if (displayData === 'ui_timeline' || getFieldType(displayData, data.type, data) === 'ui_timeline') {
+            console.log('NodeContent: Rendering timeline field', { 
+                key, 
+                value: data.value, 
+                type: data.type,
+                display: displayData
+            });
+        }
+
         if (displayData === 'group') {
             const group = props.groups?.[key];
             const groupDisabled = group ? (group.disabled !== undefined ? group.disabled : disabled) : false;
@@ -3196,6 +3916,7 @@ const NodeContent = (props: NodeContentProps) => {
             max: data.max,
             step: data.step,
             source: data.source,
+            fileType: data.fileType,
         }
 
         return <FieldMemo key={key} {...fieldProps} />;
@@ -3205,6 +3926,15 @@ const NodeContent = (props: NodeContentProps) => {
 };
 
 const FieldMemo = memo((props: FieldProps) => {
+    // Log when we're rendering a timeline field
+    if (props.fieldType === 'ui_timeline') {
+        console.log('FieldMemo: Rendering timeline field', { 
+            fieldKey: props.fieldKey, 
+            value: props.value,
+            updateStore: !!props.updateStore
+        });
+    }
+
     switch (props.fieldType) {
         case 'input':
         case 'output':
@@ -3239,6 +3969,10 @@ const FieldMemo = memo((props: FieldProps) => {
             return <UIThreeField {...props} />;
         case 'ui_text':
             return <UITextField {...props} />;
+        case 'ui_timeline':
+            return <PomsSimpleTimeline {...props} />;
+        case 'ui_video':
+            return <UIVideoPlayer {...props} />;
         default:
             return <TextField {...props} />;
     }
@@ -3268,6 +4002,8 @@ const getFieldType = (displayData: string, dataType: string, data: any) => {
             return 'ui_3d';
         } else if (dataType.toLowerCase() === 'text') {
             return 'ui_text';
+        } else if (dataType.toLowerCase() === 'video') {
+            return 'ui_video';
         }
     }
 
@@ -3297,25 +4033,34 @@ import { useMemo, useState } from 'react'
 import Box from '@mui/material/Box'
 import List from '@mui/material/List'
 import ListItem from '@mui/material/ListItem'
+import ListItemIcon from '@mui/material/ListItemIcon'
 //import ListItemButton from '@mui/material/ListItemButton'
 import ListItemText from '@mui/material/ListItemText'
 import Tabs from '@mui/material/Tabs'
 import Tab from '@mui/material/Tab'
 import AccordionDetails from '@mui/material/AccordionDetails'
 import AccordionSummary from '@mui/material/AccordionSummary'
-
-//import ToggleButton from '@mui/material/ToggleButton'
-//import ToggleButtonGroup from '@mui/material/ToggleButtonGroup'
+import ToggleButtonGroup from '@mui/material/ToggleButtonGroup'
+import ToggleButton from '@mui/material/ToggleButton'
 //import Stack from '@mui/material/Stack'
 import { useTheme } from '@mui/material/styles'
 
 import { shallow } from 'zustand/shallow';
 import { NodeRegistryState, useNodeRegistryState } from '../stores/nodeRegistryStore';
+import { useNodeState, WorkflowType } from '../stores/nodeStore';
 
 import OutlinedInput from '@mui/material/OutlinedInput'
 import SearchIcon from '@mui/icons-material/Search'
 import Accordion from '@mui/material/Accordion'
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
+import BuildIcon from '@mui/icons-material/Build'
+import ColorLensIcon from '@mui/icons-material/ColorLens'
+import AutoFixHighIcon from '@mui/icons-material/AutoFixHigh'
+import ExtensionIcon from '@mui/icons-material/Extension'
+import SettingsIcon from '@mui/icons-material/Settings'
+import ImageIcon from '@mui/icons-material/Image'
+import TextFieldsIcon from '@mui/icons-material/TextFields'
+import DataObjectIcon from '@mui/icons-material/DataObject'
 
 const sidebarWidth = 260
 
@@ -3323,8 +4068,15 @@ const selectNodeRegistryState = (state: NodeRegistryState) => ({
   nodeRegistry: state.nodeRegistry,
 });
 
-const groupBy = (field: string, nodeRegistry: any) => {
+const groupBy = (field: string, nodeRegistry: any, localMode: WorkflowType) => {
   const grouped = Object.entries(nodeRegistry).reduce((acc: any, [key, node]: [string, any]) => {
+    // Check if this node should be shown in current mode
+    const nodeType = node.type || 'workflow';
+    const nodeTypes = Array.isArray(nodeType) ? nodeType : [nodeType];
+    if (!nodeTypes.includes(localMode)) {
+      return acc;
+    }
+
     const fieldValue = node[field] || 'default';
     if (!acc[fieldValue]) {
       acc[fieldValue] = [];
@@ -3348,9 +4100,53 @@ const groupBy = (field: string, nodeRegistry: any) => {
   );
 };
 
+const getNodeIcon = (node: any) => {
+  // You can customize this based on node type, category, or module
+  const category = (node.category || '').toLowerCase();
+  const module = (node.module || '').toLowerCase();
+  
+  if (category === 'image' || module === 'image') {
+    return <ImageIcon />;
+  } else if (category === 'text' || module === 'text') {
+    return <TextFieldsIcon />;
+  } else if (category === 'data' || module === 'data') {
+    return <DataObjectIcon />;
+  } else if (category === 'settings' || module === 'settings') {
+    return <SettingsIcon />;
+  } else if (category === 'tools' || module === 'tools') {
+    return <BuildIcon />;
+  } else if (category === 'extension' || module === 'extension') {
+    return <ExtensionIcon />;
+  }
+  
+  return <AutoFixHighIcon />;
+};
+
 export default function LeftSidebar() {
   const theme = useTheme()
   const { nodeRegistry } = useNodeRegistryState(selectNodeRegistryState, shallow);
+  const { mode, loadWorkflowFromStorage, updateLocalStorage } = useNodeState(
+    state => ({ 
+      mode: state.mode,
+      loadWorkflowFromStorage: state.loadWorkflowFromStorage,
+      updateLocalStorage: state.updateLocalStorage
+    }), 
+    shallow
+  );
+
+  const handleModeChange = (_: any, newMode: WorkflowType | null) => {
+    console.log('Mode change attempted:', { newMode, currentMode: mode });
+    if (!newMode || newMode === mode) return;
+    
+    try {
+      // First load the new mode's data
+      loadWorkflowFromStorage(newMode);
+      // Then save the current state
+      updateLocalStorage();
+    } catch (error) {
+      console.error('Error changing mode:', error);
+    }
+  };
 
   // Local node search state, the code will hide the nodes that don't match the search term instead of removing them from the DOM
   const [searchTerm, setSearchTerm] = useState('')
@@ -3378,7 +4174,7 @@ export default function LeftSidebar() {
 
   const groupedNodes = useMemo(() => {
     // First get the base grouped nodes
-    const grouped = tabValue === 0 ? groupBy('module', nodeRegistry) : groupBy('category', nodeRegistry);
+    const grouped = tabValue === 0 ? groupBy('module', nodeRegistry, mode) : groupBy('category', nodeRegistry, mode);
 
     // If there's a search filter, only include nodes that match
     if (filteredNodes) {
@@ -3391,7 +4187,7 @@ export default function LeftSidebar() {
     }
 
     return grouped;
-  }, [nodeRegistry, filteredNodes, tabValue]);
+  }, [nodeRegistry, filteredNodes, tabValue, mode]);
 
   return (
     <Box
@@ -3407,17 +4203,43 @@ export default function LeftSidebar() {
       }}
     >
       <Box sx={{ p: 1.5, borderBottom: `1px solid ${theme.palette.divider}` }}>
-        <OutlinedInput
-          startAdornment={<SearchIcon fontSize="small" sx={{ marginRight: 1 }} />}
-          id="main-module-search"
-          placeholder="Search"
+        <ToggleButtonGroup
+          orientation="vertical"
+          value={mode}
+          exclusive
+          onChange={handleModeChange}
+          aria-label="mode switch"
           size="small"
-          value={searchTerm}
-          onChange={(e) => setSearchTerm(e.target.value)}
-          sx={{ width: '100%', fontSize: '14px' }}
-        />
+          fullWidth
+          sx={{ 
+            display: 'flex', 
+            flexDirection: 'column',
+            '& .MuiToggleButton-root': {
+              flex: 1,
+              padding: '8px',
+              minHeight: '36px',
+              border: `1px solid ${theme.palette.divider}`,
+              '&:not(:first-of-type)': {
+                borderTop: 'none'
+              }
+            }
+          }}
+        >
+          <ToggleButton 
+            value="workflow" 
+            aria-label="workflow mode"
+          >
+            <BuildIcon />
+          </ToggleButton>
+          <ToggleButton 
+            value="tool" 
+            aria-label="tool mode"
+          >
+            <ColorLensIcon />
+          </ToggleButton>
+        </ToggleButtonGroup>
       </Box>
-      <Box sx={{ width: '100%' }}>
+      <Box sx={{ width: '100%', borderBottom: `1px solid ${theme.palette.divider}`, p: 1.5 }}>
         <Tabs
           value={tabValue}
           onChange={handleTabChange}
@@ -3429,66 +4251,79 @@ export default function LeftSidebar() {
             '.MuiButtonBase-root': { textTransform: 'none', lineHeight: '16px', minHeight: 0 }
           }}
         >
-          <Tab label="Modules" />
-          <Tab label="Categories" />
+          <Tab label="Current" />
+          <Tab label="New" />
         </Tabs>
+        <OutlinedInput
+          startAdornment={<SearchIcon fontSize="small" sx={{ marginRight: 1 }} />}
+          id="main-module-search"
+          placeholder="Search"
+          size="small"
+          value={searchTerm}
+          onChange={(e) => setSearchTerm(e.target.value)}
+          sx={{ width: '100%', fontSize: '14px', mt: 1 }}
+        />
       </Box>
       <Box sx={{
         flex: 1,
         overflowY: 'auto',
         p: 0, m: 0,
       }}>
-        <Box sx={{ p: 0, pb: 0, m: 0 }}>
-          {Object.entries(groupedNodes).map(([module, nodes]: [string, any]) => (
-            <Accordion disableGutters key={module} sx={{
-              borderBottom: `1px solid ${theme.palette.divider}`,
-              boxShadow: 'none',
-              backgroundColor: '#1a1a1a',
-              fontSize: 12,
-              p: 0, m: 0,
-              '&:before': {
-                backgroundColor: 'transparent',
-              },
-              '.MuiAccordionSummary-root': {
-                backgroundColor: '#1a1a1a',
-                '&:hover': {
-                  backgroundColor: 'rgba(255, 255, 255, 0.1)',
+        {tabValue === 1 && searchTerm.trim() === "" ? (
+          <Box sx={{ p: 2, textAlign: 'center', color: theme.palette.text.secondary }}>
+            Enter text to start searching
+          </Box>
+        ) : (
+          <Box sx={{ p: 0, pb: 0, m: 0 }}>
+            {Object.entries(groupedNodes).map(([module, nodes]: [string, any]) => (
+              <Accordion disableGutters key={module} sx={{
+                borderBottom: `1px solid ${theme.palette.divider}`,
+                boxShadow: 'none',
+                backgroundColor: theme.palette.background.paper,
+                fontSize: 12,
+                p: 0, m: 0,
+                '&:before': { backgroundColor: 'transparent' },
+                '.MuiAccordionSummary-root': {
+                  backgroundColor: theme.palette.background.paper,
+                  '&:hover': { backgroundColor: 'rgba(255, 255, 255, 0.1)' },
                 },
-              },
-              '.MuiAccordionDetails-root': {
-                backgroundColor: '#1a1a1a',
-                padding: '8px 4px',
-              },
-            }}>
-              <AccordionSummary expandIcon={<ExpandMoreIcon />}>{module.replace(/[_-]/g, ' ').replace(/\b\w/g, char => char.toUpperCase())}</AccordionSummary>
-              <AccordionDetails>
-                <List dense={true} sx={{ p: 1.5, pt: 0, pb: 0, m: 0 }}>
-                  {nodes.map((node: any) => (
-                    <ListItem
-                      key={node.key}
-                      draggable
-                      className={`${node.key} category-${node.category} module-${node.module}`}
-                      onDragStart={(event) => onDragStart(event, node.key)}
-                      sx={{
-                        outline: `1px solid ${theme.palette.divider}`,
-                        borderRadius: 1,
-                        boxShadow: 3,
-                        m: 0, mb: 1,
-                        p: 0.5, pl: 1,
-                        borderLeftWidth: '8px',
-                        borderLeftStyle: 'solid',
-                        cursor: 'grab',
-                        display: !filteredNodes || filteredNodes.includes(node.key) ? 'flex' : 'none',
-                      }}
-                    >
-                      <ListItemText primary={node.label || node.key} sx={{ '& .MuiTypography-root': { fontSize: 12 } }} />
-                    </ListItem>
-                  ))}
-                </List>
-              </AccordionDetails>
-            </Accordion>
-          ))}
-        </Box>
+                '.MuiAccordionDetails-root': {
+                  backgroundColor: theme.palette.background.paper,
+                  padding: '8px 4px',
+                },
+              }}>
+                <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+                  {module.replace(/[_-]/g, ' ').replace(/\b\w/g, char => char.toUpperCase())}
+                </AccordionSummary>
+                <AccordionDetails>
+                  <List dense={true} sx={{ p: 1.5, pt: 0, pb: 0, m: 0 }}>
+                    {nodes.map((node: any) => (
+                      <ListItem
+                        key={node.key}
+                        draggable
+                        className={`${node.key} category-${node.category} module-${node.module}`}
+                        onDragStart={(event) => onDragStart(event, node.key)}
+                        sx={{
+                          outline: `1px solid ${theme.palette.divider}`,
+                          borderRadius: 1,
+                          boxShadow: 3,
+                          m: 0, mb: 1,
+                          p: 0.5, pl: 1,
+                          borderLeftWidth: '8px',
+                          borderLeftStyle: 'solid',
+                          cursor: 'grab',
+                          display: !filteredNodes || filteredNodes.includes(node.key) ? 'flex' : 'none',
+                        }}
+                      >
+                        <ListItemText primary={node.label || node.key} sx={{ '& .MuiTypography-root': { fontSize: 12 } }} />
+                      </ListItem>
+                    ))}
+                  </List>
+                </AccordionDetails>
+              </Accordion>
+            ))}
+          </Box>
+        )}
       </Box>
     </Box>
   )
@@ -3859,16 +4694,114 @@ FILE: client/src/components/fields/FileBrowserField.tsx
 ================================================================================
 
 import { FieldProps } from "../NodeContent";
-import { useState } from "react";
+import { useState, useRef, useCallback, memo } from "react";
+import config from "../../../config";
+import { useWebsocketState } from "../../stores/websocketStore";
 
 import Box from "@mui/material/Box";
 import MuiTextField from "@mui/material/TextField";
 import Stack from "@mui/material/Stack";
 import IconButton from "@mui/material/IconButton";
 import FolderOpenOutlinedIcon from '@mui/icons-material/FolderOpenOutlined';
-import Dialog from "@mui/material/Dialog";
+import CloseIcon from '@mui/icons-material/Close';
+import Card from "@mui/material/Card";
+import CardMedia from "@mui/material/CardMedia";
 
-const FileBrowserField = ({
+interface ExtendedFieldProps extends FieldProps {
+    accept?: string;  // File type accept string (e.g. "image/*,audio/*")
+    fileType?: 'image' | 'audio' | 'video' | 'text' | 'any';  // Type of file for validation
+}
+
+// Map file types to accept strings
+const fileTypeToAccept: Record<string, string> = {
+    'image': '.jpg,.jpeg,.png,.gif,.webp,.bmp,.svg',
+    'audio': '.mp3,.wav,.ogg,.m4a,.aac,.webm',
+    'video': '.mp4,.webm,.ogv',
+    'text': '.txt,.md,.html,.css,.js,.json',
+    'any': '*/*'
+};
+
+const FilePreview = memo(({ value, fileType, onClear }: { 
+    value: string | null, 
+    fileType: string,
+    onClear: () => void 
+}) => {
+    if (!value) return null;
+
+    // Only show preview for files in the data/files directory
+    if (!value.startsWith('data/files/')) return null;
+
+    const fileUrl = `http://${config.serverAddress}/${value}`;
+
+    const PreviewWrapper = ({ children }: { children: React.ReactNode }) => (
+        <Box sx={{ 
+            position: 'relative', 
+            mt: 1,
+            mx: -2  // Negative margin to counteract the Stack padding
+        }}>
+            <IconButton
+                size="small"
+                onClick={onClear}
+                sx={{
+                    position: 'absolute',
+                    right: 8,  // Adjusted to account for new margin
+                    top: -8,
+                    zIndex: 1,
+                    bgcolor: 'background.paper',
+                    boxShadow: 1,
+                    '&:hover': {
+                        bgcolor: 'background.paper',
+                    }
+                }}
+            >
+                <CloseIcon fontSize="small" />
+            </IconButton>
+            {children}
+        </Box>
+    );
+
+    switch (fileType) {
+        case 'image':
+            return (
+                <PreviewWrapper>
+                    <Card sx={{ width: '100%' }}>
+                        <CardMedia
+                            component="img"
+                            height="140"
+                            image={fileUrl}
+                            sx={{ objectFit: 'contain', width: '100%' }}
+                        />
+                    </Card>
+                </PreviewWrapper>
+            );
+        case 'audio':
+            return (
+                <PreviewWrapper>
+                    <Box sx={{ width: '100%' }}>
+                        <audio controls src={fileUrl} style={{ width: '100%' }} />
+                    </Box>
+                </PreviewWrapper>
+            );
+        case 'video':
+            return (
+                <PreviewWrapper>
+                    <Box sx={{ width: '100%' }}>
+                        <video 
+                            controls 
+                            src={fileUrl} 
+                            style={{ width: '100%', maxHeight: '200px', objectFit: 'contain' }} 
+                        />
+                    </Box>
+                </PreviewWrapper>
+            );
+        default:
+            return null;
+    }
+});
+
+FilePreview.displayName = 'FilePreview';
+
+const FileBrowserField = memo(({
     fieldKey,
     value,
     style,
@@ -3876,16 +4809,125 @@ const FileBrowserField = ({
     hidden,
     label,
     updateStore,
-}: FieldProps) => {
-    const [open, setOpen] = useState(false);
+    accept,
+    fileType = 'any',
+}: ExtendedFieldProps) => {
+    const fileInputRef = useRef<HTMLInputElement>(null);
+    const [error, setError] = useState<string | null>(null);
+    const [uploading, setUploading] = useState(false);
+    const { sid } = useWebsocketState();
 
-    const handleClickOpen = () => {
-      setOpen(true);
-    };
-  
-    const handleClose = () => {
-      setOpen(false);
-    };
+    const validateFile = useCallback((file: File): boolean => {
+        if (fileType === 'any') return true;
+
+        const fileTypeMap: Record<string, RegExp> = {
+            'image': /^image\/(jpeg|png|gif|webp|bmp|svg\+xml)$/i,
+            'audio': /^audio\/(mpeg|wav|ogg|mp4|aac|webm)$/i,
+            'video': /^video\/(mp4|webm|ogg)$/i,
+            'text': /^text\/(plain|markdown|html|css|javascript|json)$/i
+        };
+
+        const validationType = fileTypeMap[fileType];
+        if (!validationType) return true;
+
+        if (!validationType.test(file.type)) {
+            setError(`Invalid file type. Allowed types: ${fileTypeToAccept[fileType].split(',').join(', ')}`);
+            return false;
+        }
+        return true;
+    }, [fileType]);
+
+    const handleFileSelect = useCallback(async (event: React.ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0];
+        if (!file) return;
+
+        setError(null);
+
+        // Explicit size validation
+        if (file.size === 0) {
+            setError('Selected file is empty');
+            if (fileInputRef.current) {
+                fileInputRef.current.value = '';
+            }
+            return;
+        }
+
+        if (!validateFile(file)) {
+            if (fileInputRef.current) {
+                fileInputRef.current.value = '';
+            }
+            return;
+        }
+
+        try {
+            setUploading(true);
+            
+            // Create a fresh blob from the file to ensure a clean stream
+            const fileBlob = file.slice(0, file.size, file.type);
+            const formData = new FormData();
+            formData.append('file', fileBlob, file.name);
+
+            console.log('FileBrowser: Starting upload', {
+                fileName: file.name,
+                fileType: file.type,
+                fileSize: file.size,
+                blobSize: fileBlob.size
+            });
+
+            const response = await fetch(`http://${config.serverAddress}/data/files`, {
+                method: 'POST',
+                body: formData,
+                credentials: 'include',
+                mode: 'cors'
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`Upload failed: ${errorText}`);
+            }
+
+            const fileName = await response.text();
+            const filePath = `data/files/${fileName}`;
+
+            // Verify the file exists on the server
+            await new Promise(resolve => setTimeout(resolve, 1000)); // Wait for file to be written
+            const checkResponse = await fetch(`http://${config.serverAddress}/${filePath}`, {
+                method: 'HEAD',
+                credentials: 'include',
+                mode: 'cors'
+            });
+
+            if (!checkResponse.ok) {
+                throw new Error('File was not properly saved on the server');
+            }
+
+            updateStore?.(fieldKey, filePath);
+        } catch (error) {
+            console.error('Error uploading file:', error);
+            setError(error instanceof Error ? error.message : 'Failed to upload file');
+        } finally {
+            setUploading(false);
+            if (fileInputRef.current) {
+                fileInputRef.current.value = '';
+            }
+        }
+    }, [fieldKey, validateFile, updateStore]);
+
+    const handleBrowseClick = useCallback(() => {
+        fileInputRef.current?.click();
+    }, []);
+
+    const handleTextChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+        setError(null);
+        updateStore?.(fieldKey, e.target.value);
+    }, [fieldKey, updateStore]);
+
+    const handleClear = useCallback(() => {
+        updateStore?.(fieldKey, '');
+        if (fileInputRef.current) {
+            fileInputRef.current.value = '';
+        }
+    }, [fieldKey, updateStore]);
 
     return (
         <Box
@@ -3894,42 +4936,64 @@ const FileBrowserField = ({
             className={`${disabled ? 'mellon-disabled' : ''} ${hidden ? 'mellon-hidden' : ''}`}
         >
             <Stack
-                direction="row"
+                direction="column"
                 spacing={1}
-                sx={{
-                    '& > .MuiBox-root': { flex: "1" },
-                    '& > .flex-auto': { flex: "0 0 auto" },
-                    justifyContent: "center",
-                    alignItems: "stretch",
-                }}
             >
-                <MuiTextField
-                    onChange={(e) => updateStore?.(fieldKey, e.target.value)}
-                    variant="outlined"
-                    type="text"
-                    size="small"
-                    fullWidth
-                    label={label}
-                    value={value}
-                    className="nodrag"
-                    autoComplete="off"
+                <Stack
+                    direction="row"
+                    spacing={1}
+                    sx={{
+                        '& > .MuiBox-root': { flex: "1" },
+                        '& > .flex-auto': { flex: "0 0 auto" },
+                        justifyContent: "center",
+                        alignItems: "stretch",
+                    }}
+                >
+                    <MuiTextField
+                        onChange={handleTextChange}
+                        variant="outlined"
+                        type="text"
+                        size="small"
+                        fullWidth
+                        label={label}
+                        value={value || ''}
+                        className="nodrag"
+                        autoComplete="off"
+                        error={!!error}
+                        helperText={error}
+                        disabled={disabled || uploading}
+                    />
+                    <IconButton 
+                        onClick={handleBrowseClick} 
+                        disabled={disabled || uploading}
+                    >
+                        <FolderOpenOutlinedIcon />
+                    </IconButton>
+                    <input
+                        type="file"
+                        ref={fileInputRef}
+                        style={{ display: 'none' }}
+                        onChange={handleFileSelect}
+                        accept={accept || fileTypeToAccept[fileType]}
+                        disabled={disabled || uploading}
+                    />
+                </Stack>
+                {error && (
+                    <Box sx={{ color: 'error.main', fontSize: '0.75rem', px: 1 }}>
+                        {error}
+                    </Box>
+                )}
+                <FilePreview 
+                    value={value} 
+                    fileType={fileType} 
+                    onClear={handleClear}
                 />
-                <IconButton onClick={handleClickOpen}>
-                    <FolderOpenOutlinedIcon />
-                </IconButton>
             </Stack>
-            <Dialog
-                open={open}
-                onClose={handleClose}
-                aria-labelledby="file-browser-dialog"
-            >
-                <Box>
-                    Not yet implemented
-                </Box>
-            </Dialog>
         </Box>
     );
-}
+});
+
+FileBrowserField.displayName = 'FileBrowserField';
 
 export default FileBrowserField;
 
@@ -5132,7 +6196,16 @@ const UITextField = ({
             <Box
                 component="pre"
                 data-key={fieldKey}
-                sx={{ color: theme.palette.text.secondary, backgroundColor: '#111', border: `1px solid ${theme.palette.divider}`, borderRadius: 1, padding: 1, m: 0, mb: 1, ...style }}
+                sx={{ 
+                    color: theme.palette.text.secondary, 
+                    backgroundColor: theme.palette.mode === 'light' ? '#ffffff' : '#111',
+                    border: `1px solid ${theme.palette.divider}`, 
+                    borderRadius: 1, 
+                    padding: 1, 
+                    m: 0, 
+                    mb: 1, 
+                    ...style 
+                }}
                 className={`${disabled ? 'mellon-disabled' : ''} ${hidden ? 'mellon-hidden' : ''}`}
             >
                 <Typography>{dataValue}</Typography>
@@ -5422,3 +6495,391 @@ export default function ThreePreview({ value, ...props }: { value: any, [key: st
         </div>
     );
 }
+
+================================================================================
+FILE: client/src/components/fields/UIVideoPlayer.tsx
+================================================================================
+
+import React, { useRef, useState, useEffect } from 'react';
+import { Box, IconButton, Slider, Stack, Typography } from '@mui/material';
+import PlayArrowIcon from '@mui/icons-material/PlayArrow';
+import PauseIcon from '@mui/icons-material/Pause';
+import FastRewindIcon from '@mui/icons-material/FastRewind';
+import FastForwardIcon from '@mui/icons-material/FastForward';
+import config from '../../../config';
+import { FieldProps } from '../NodeContent';
+import { useTheme } from "@mui/material/styles";
+
+const UIVideoPlayer = ({
+  fieldKey,
+  value,
+  style,
+  disabled,
+  hidden,
+  label,
+  updateStore
+}: FieldProps) => {
+    const theme = useTheme();
+
+    const dataValue = value.value;
+    // Debug: log on mount
+
+    
+    useEffect(() => {
+        console.log('UIVideoPlayer mounted with props:', {
+        value,
+        fieldKey,            
+        configServer: config.serverAddress,
+        valueIsNull: value === null,
+        // Now we ALWAYS expect value is an object with .value
+        // so you can remove type checks if you like.
+        });
+    }, [value, fieldKey]);
+
+    // Only keep valid DOM props to avoid React warnings
+
+
+    // Remove known non-DOM props from boxProps
+
+    // In UITextField we do: const dataValue = value.value;
+    // So let's do exactly that here:
+    
+
+    // If there's no usable string in videoValue, just render a "No video selected" placeholder
+    if (!dataValue) {
+        console.log('UIVideoPlayer: Rendering placeholder because videoValue is falsy:', dataValue);
+        return (
+        <Box
+            component="div"
+            sx={{
+            width: '100%',
+            aspectRatio: '16/9',
+            maxHeight: '200px',
+            backgroundColor: 'black',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+            }}
+            style={style}
+        >
+            <Typography variant="body2" color="gray">
+            No video selected
+            </Typography>
+        </Box>
+        );
+    }
+
+    // Build the final video URL
+    // If filePath doesn't start with '/', assume it needs '/data/files/' prepended
+    const filePath = dataValue;
+    const adjustedPath = filePath.startsWith('/') ? filePath : `/data/files/${filePath}`;
+    const videoUrl = `http://${config.serverAddress}${adjustedPath}`;
+    console.log('UIVideoPlayer: Final videoUrl:', videoUrl);
+
+    // Local state
+    const videoRef = useRef<HTMLVideoElement>(null);
+    const [playing, setPlaying] = useState(false);
+    const [currentTime, setCurrentTime] = useState<number>(0);
+    const [duration, setDuration] = useState<number>(0);
+    const [error, setError] = useState<string | null>(null);
+
+    // Debug if error changes
+    useEffect(() => {
+        if (error) {
+        console.log('UIVideoPlayer: error updated:', error);
+        }
+    }, [error]);
+
+    const handlePlayPause = () => {
+        if (!videoRef.current) return;
+        if (playing) {
+        videoRef.current.pause();
+        setPlaying(false);
+        } else {
+        videoRef.current
+            .play()
+            .then(() => setPlaying(true))
+            .catch(err => {
+            setError(`Failed to play video: ${err.message}`);
+            setPlaying(false);
+            });
+        }
+    };
+
+    const handleRewind = () => {
+        if (videoRef.current) {
+        videoRef.current.currentTime = Math.max(videoRef.current.currentTime - 10, 0);
+        }
+    };
+
+    const handleForward = () => {
+        if (videoRef.current) {
+        videoRef.current.currentTime = Math.min(videoRef.current.currentTime + 10, duration);
+        }
+    };
+
+    const handleTimeUpdate = () => {
+        if (videoRef.current) {
+        setCurrentTime(videoRef.current.currentTime);
+        }
+    };
+
+    const handleLoadedMetadata = () => {
+        if (videoRef.current) {
+        setDuration(videoRef.current.duration);
+        setError(null);
+        }
+    };
+
+    const handleError = (e: React.SyntheticEvent<HTMLVideoElement>) => {
+        const target = e.currentTarget;
+        // If the browser provides an error object:
+        setError(`Failed to load video: ${target.error?.message || 'Unknown error'}`);
+        setPlaying(false);
+    };
+
+    const handleSliderChange = (
+        _event: Event,
+        sliderValue: number | number[],
+        _activeThumb: number
+    ) => {
+        if (!videoRef.current) return;
+        if (typeof sliderValue === 'number') {
+        videoRef.current.currentTime = sliderValue;
+        setCurrentTime(sliderValue);
+        }
+    };
+
+    if (error) {
+        return (
+        <Box
+            component="div"
+            sx={{
+            p: 2,
+            bgcolor: 'error.main',
+            color: 'error.contrastText',
+            borderRadius: 1
+            }}
+            style={style}
+        >
+            {error}
+        </Box>
+        );
+    }
+
+    return (
+        <Box 
+            component="div" 
+            style={style}
+            className="nodrag"
+        >
+            <video
+                ref={videoRef}
+                src={videoUrl}
+                onTimeUpdate={handleTimeUpdate}
+                onLoadedMetadata={handleLoadedMetadata}
+                onError={handleError}
+                style={{ width: '100%', maxHeight: '500px', backgroundColor: 'black' }}
+            />
+            <Stack
+                direction="row"
+                spacing={2}
+                alignItems="center"
+                justifyContent="center"
+                sx={{ mt: 1 }}
+            >
+                <IconButton onClick={handleRewind} aria-label="rewind">
+                <FastRewindIcon />
+                </IconButton>
+                <IconButton onClick={handlePlayPause} aria-label={playing ? 'pause' : 'play'}>
+                {playing ? <PauseIcon /> : <PlayArrowIcon />}
+                </IconButton>
+                <IconButton onClick={handleForward} aria-label="forward">
+                <FastForwardIcon />
+                </IconButton>
+            </Stack>
+            <Slider
+                value={currentTime}
+                min={0}
+                max={duration}
+                step={1}
+                onChange={handleSliderChange}
+                aria-label="time slider"
+            />
+        </Box>
+    );
+    };
+
+    export default UIVideoPlayer;
+
+
+================================================================================
+FILE: client/src/services/dataService.ts
+================================================================================
+
+import config from '../../config';
+
+export interface NodePersistentData {
+    params: { [key: string]: any };
+    files?: string[];
+    cache?: boolean;
+    time?: number;
+    memory?: number;
+    event?: string;
+    eventId?: number;
+}
+
+class DataService {
+    private baseUrl: string;
+    private readonly FILES_BASE_PATH = '';
+
+    constructor() {
+        this.baseUrl = `http://${config.serverAddress}`;
+    }
+
+    getFullFilePath(fileName: string): string {
+        const baseFileName = fileName.includes('/') ? fileName.split('/').pop()! : fileName;
+        return baseFileName;
+    }
+
+    async saveNodeData(nodeName: string, data: NodePersistentData): Promise<void> {
+        console.log('📤 DataService.saveNodeData called:', {
+            nodeName,
+            data: JSON.stringify(data).slice(0, 500) + '...',
+            hasEvent: Boolean(data.event),
+            event: data.event,
+            eventId: data.eventId,
+            timestamp: new Date().toISOString()
+        });
+
+        if (data.params && !data.event && data.params.event) {
+            data.event = data.params.event;
+            delete data.params.event;
+        }
+        if (data.params && !data.eventId && data.params.eventId) {
+            data.eventId = data.params.eventId;
+            delete data.params.eventId;
+        }
+
+        const response = await fetch(`${this.baseUrl}/node/${nodeName}/data`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(data)
+        });
+        
+        if (!response.ok) {
+            console.error('❌ Failed to save node data:', {
+                nodeName,
+                status: response.status,
+                statusText: response.statusText,
+                timestamp: new Date().toISOString()
+            });
+            throw new Error(`Failed to save node data: ${response.statusText}`);
+        }
+
+        console.log('✅ DataService.saveNodeData success:', {
+            nodeName,
+            timestamp: new Date().toISOString()
+        });
+    }
+
+    async loadNodeData(nodeName: string): Promise<NodePersistentData | null> {
+        try {
+            console.log('📥 DataService.loadNodeData called:', {
+                nodeName,
+                timestamp: new Date().toISOString()
+            });
+
+            const response = await fetch(`${this.baseUrl}/node/${nodeName}/data`);
+            if (response.ok) {
+                const data = await response.json();
+                console.log('✅ DataService.loadNodeData success:', {
+                    nodeName,
+                    hasEvent: Boolean(data.event),
+                    event: data.event,
+                    eventId: data.eventId,
+                    data: JSON.stringify(data).slice(0, 500) + '...',
+                    timestamp: new Date().toISOString()
+                });
+                return data;
+            }
+            if (response.status === 404) {
+                console.log('⚠️ DataService.loadNodeData - No data found:', {
+                    nodeName,
+                    timestamp: new Date().toISOString()
+                });
+                return null;
+            }
+            throw new Error(`Failed to load node data: ${response.statusText}`);
+        } catch (error: any) {
+            console.error('❌ DataService.loadNodeData error:', {
+                nodeName,
+                error: error.message,
+                stack: error.stack,
+                timestamp: new Date().toISOString()
+            });
+            return null;
+        }
+    }
+
+    async deleteNodeData(nodeName: string): Promise<void> {
+        const response = await fetch(`${this.baseUrl}/node/${nodeName}/data`, {
+            method: 'DELETE'
+        });
+        
+        if (!response.ok) {
+            throw new Error(`Failed to delete node data: ${response.statusText}`);
+        }
+    }
+
+    async saveNodeFile(nodeName: string, fileName: string, fileData: ArrayBuffer): Promise<string> {
+        const formData = new FormData();
+        const baseFileName = fileName.includes('/') ? fileName.split('/').pop()! : fileName;
+        formData.append('file', new Blob([fileData]), baseFileName);
+
+        const response = await fetch(`${this.baseUrl}/data/files`, {
+            method: 'POST',
+            body: formData
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to save node file: ${response.statusText}`);
+        }
+
+        return baseFileName;
+    }
+
+    async loadNodeFile(nodeName: string, fileName: string): Promise<ArrayBuffer | null> {
+        try {
+            const baseFileName = fileName.includes('/') ? fileName.split('/').pop()! : fileName;
+            const response = await fetch(`${this.baseUrl}/data/files/${baseFileName}`);
+            if (response.ok) {
+                return await response.arrayBuffer();
+            }
+            if (response.status === 404) {
+                return null;
+            }
+            throw new Error(`Failed to load node file: ${response.statusText}`);
+        } catch (error) {
+            console.error(`Error loading file ${fileName} for node ${nodeName}:`, error);
+            return null;
+        }
+    }
+
+    async deleteNodeFile(nodeName: string, fileName: string): Promise<void> {
+        const baseFileName = fileName.includes('/') ? fileName.split('/').pop()! : fileName;
+        const response = await fetch(`${this.baseUrl}/data/files/${baseFileName}`, {
+            method: 'DELETE'
+        });
+        
+        if (!response.ok) {
+            throw new Error(`Failed to delete node file: ${response.statusText}`);
+        }
+    }
+}
+
+// Create and export a singleton instance
+export const dataService = new DataService();
+export default dataService; 

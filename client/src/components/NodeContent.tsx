@@ -24,6 +24,8 @@ import UIImageField from "./fields/UIImageField";
 import UIThreeField from "./fields/UIThreeField";
 import FileBrowserField from "./fields/FileBrowserField";
 import UITextField from "./fields/UITextField";
+import PomsSimpleTimeline from "./fields/PomsSimpleTimeline";
+import UIVideoPlayer from "./fields/UIVideoPlayer";
 
 // These are the props sent to the fields
 export type FieldProps = {
@@ -43,6 +45,7 @@ export type FieldProps = {
     max?: number;
     step?: number;
     source?: string;
+    fileType?: 'image' | 'audio' | 'video' | 'text' | 'any';
     updateStore?: (param: string, value: any, key?: keyof NodeParams) => void;
     onChangeAction?: { action: string, target?: any };
 }
@@ -75,6 +78,16 @@ const NodeContent = (props: NodeContentProps) => {
         const sxStyle = data.style || {};
         const label = data.label || key;
         
+        // Log when we're rendering a timeline field
+        if (displayData === 'ui_timeline' || getFieldType(displayData, data.type, data) === 'ui_timeline') {
+            console.log('NodeContent: Rendering timeline field', { 
+                key, 
+                value: data.value, 
+                type: data.type,
+                display: displayData
+            });
+        }
+
         if (displayData === 'group') {
             const group = props.groups?.[key];
             const groupDisabled = group ? (group.disabled !== undefined ? group.disabled : disabled) : false;
@@ -145,6 +158,7 @@ const NodeContent = (props: NodeContentProps) => {
             max: data.max,
             step: data.step,
             source: data.source,
+            fileType: data.fileType,
         }
 
         return <FieldMemo key={key} {...fieldProps} />;
@@ -154,6 +168,15 @@ const NodeContent = (props: NodeContentProps) => {
 };
 
 const FieldMemo = memo((props: FieldProps) => {
+    // Log when we're rendering a timeline field
+    if (props.fieldType === 'ui_timeline') {
+        console.log('FieldMemo: Rendering timeline field', { 
+            fieldKey: props.fieldKey, 
+            value: props.value,
+            updateStore: !!props.updateStore
+        });
+    }
+
     switch (props.fieldType) {
         case 'input':
         case 'output':
@@ -188,6 +211,10 @@ const FieldMemo = memo((props: FieldProps) => {
             return <UIThreeField {...props} />;
         case 'ui_text':
             return <UITextField {...props} />;
+        case 'ui_timeline':
+            return <PomsSimpleTimeline {...props} />;
+        case 'ui_video':
+            return <UIVideoPlayer {...props} />;
         default:
             return <TextField {...props} />;
     }
@@ -217,6 +244,8 @@ const getFieldType = (displayData: string, dataType: string, data: any) => {
             return 'ui_3d';
         } else if (dataType.toLowerCase() === 'text') {
             return 'ui_text';
+        } else if (dataType.toLowerCase() === 'video') {
+            return 'ui_video';
         }
     }
 

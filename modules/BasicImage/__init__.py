@@ -69,6 +69,7 @@ MODULE_MAP = {
                 'label': 'Path',
                 'type': 'string',
                 'display': 'filebrowser',
+                'fileType': 'image',
             },
             'images': {
                 'label': 'Image',

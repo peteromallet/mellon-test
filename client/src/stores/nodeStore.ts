@@ -174,6 +174,7 @@ export type NodeState = {
     nodes: CustomNodeType[];
     edges: Edge[];
     mode: WorkflowType;
+    viewport: { x: number; y: number; zoom: number } | undefined;
     onNodesChange: OnNodesChange<CustomNodeType>;
     onEdgesChange: OnEdgesChange;
     onEdgeDoubleClick: (id: string) => void;
@@ -187,31 +188,43 @@ export type NodeState = {
     updateLocalStorage: () => void;
     loadWorkflowFromStorage: (mode?: WorkflowType) => void;
     runSubGraph: (sid: string, nodeId: string) => Promise<void>;
+    setViewport: (viewport: { x: number; y: number; zoom: number }) => void;
 };
 
 export const useNodeState = createWithEqualityFn<NodeState>((set, get) => ({
     nodes: [],
     edges: [],
+    viewport: undefined,
     mode: (() => {
         const lastMode = localStorage.getItem(LAST_MODE_KEY);
         return (lastMode === 'workflow' || lastMode === 'tool') ? lastMode : 'workflow';
     })(),
+
+    setViewport: (viewport: { x: number; y: number; zoom: number }) => {
+        set({ viewport });
+        get().updateLocalStorage();
+    },
 
     loadWorkflowFromStorage: (overrideMode) => {
         const currentMode = overrideMode ?? get().mode;
         const key = getLocalStorageKey(currentMode);
         const stored = localStorage.getItem(key);
 
+        // Set the mode first, before any other operations
+        if (overrideMode) {
+            set({ mode: overrideMode });
+            localStorage.setItem(LAST_MODE_KEY, overrideMode);
+        }
+
         if (stored) {
             const data: StoredWorkflow = JSON.parse(stored);
             set({
                 nodes: data.nodes || [],
                 edges: data.edges || [],
-                mode: data.type ?? currentMode
+                viewport: data.viewport
             });
-            localStorage.setItem(LAST_MODE_KEY, currentMode);
         } else {
-            set({ nodes: [], edges: [] });
+            set({ nodes: [], edges: [], viewport: undefined });
         }
     },
 
@@ -369,8 +382,11 @@ export const useNodeState = createWithEqualityFn<NodeState>((set, get) => ({
         const oldVal = existingNode.data.params[key]?.value;
         if (oldVal === value) {
             // If nothing changed, we skip the update and skip triggering sub-graph
+            console.log('nodeStore: Skipping update - no change detected', { id, key, value, oldVal });
             return;
         }
+
+        console.log('nodeStore: Updating param value', { id, key, oldValue: oldVal, newValue: value });
 
         set({
             nodes: get().nodes.map((node) => (
@@ -394,6 +410,15 @@ export const useNodeState = createWithEqualityFn<NodeState>((set, get) => ({
         
         get().updateLocalStorage();
 
+        // Verify the update was applied
+        const updatedNode = get().nodes.find(n => n.id === id);
+        console.log('nodeStore: After update', { 
+            id, 
+            key, 
+            newStoredValue: updatedNode?.data.params[key]?.value,
+            fullParams: updatedNode?.data.params
+        });
+
         // If this node is "continuous", do a partial run
         if (existingNode.data.execution_type === 'continuous') {
             // Get the sid from websocket store
@@ -407,19 +432,19 @@ export const useNodeState = createWithEqualityFn<NodeState>((set, get) => ({
         const { nodes, edges, mode } = get();
         const key = getLocalStorageKey(mode);
 
-        const stored = localStorage.getItem(key);
-        let viewport = { x: 0, y: 0, zoom: 1 };
-        if (stored) {
-            const parsed = JSON.parse(stored);
-            if (parsed.viewport) viewport = parsed.viewport;
-        }
-
         const data: StoredWorkflow = {
             type: mode,
             nodes,
             edges,
-            viewport
+            viewport: get().viewport
         };
+        console.log('nodeStore: Updating localStorage', { 
+            key,
+            mode,
+            nodeCount: nodes.length,
+            edgeCount: edges.length,
+            viewport: get().viewport
+        });
         localStorage.setItem(key, JSON.stringify(data));
         localStorage.setItem(LAST_MODE_KEY, mode);
     },

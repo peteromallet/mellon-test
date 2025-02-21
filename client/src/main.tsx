@@ -1,57 +1,34 @@
 import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
-import {ReactFlowProvider } from '@xyflow/react'
+import { ReactFlowProvider } from '@xyflow/react'
 
 import { createTheme, ThemeProvider } from '@mui/material/styles';
 import CssBaseline from '@mui/material/CssBaseline';
 import "@fontsource/jetbrains-mono/latin-400.css";
 import "@fontsource/jetbrains-mono/latin-700.css";
+import "@fontsource/inter/latin-400.css";
+import "@fontsource/inter/latin-500.css";
+import "@fontsource/inter/latin-600.css";
 
 import { WebSocketProvider } from './components/WebsocketContext';
-
-const themeOptions = createTheme({
-  components: {
-    MuiAccordionSummary: {
-      styleOverrides: {
-        root: {
-          fontFamily: 'JetBrains Mono',
-        },
-      },
-    },
-  },
-  palette: {
-    mode: 'dark',
-    primary: {
-      main: '#ffb300',
-    },
-    secondary: {
-      main: '#00695f',
-    },
-    background: {
-      default: '#121212',
-      paper: '#1a1a1a',
-    },
-  },
-  typography: {
-    fontSize: 14,
-    fontFamily: 'JetBrains Mono',
-  },
-  /* Disable all transitions
-  transitions: {
-    create: () => 'none',
-  }
-  */
-});
+import { useNodeState } from './stores/nodeStore';
+import { shallow } from 'zustand/shallow';
+import { getThemeOptions } from './theme/themeConfig';
+import { ThemeInjector } from './theme/ThemeInjector';
 
 import App from './App.tsx'
 import Box from '@mui/material/Box';
 import ToolBar from './components/ToolBar.tsx';
 import ActionBar from './components/ActionBar.tsx';
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <ThemeProvider theme={themeOptions}>
+function ThemedApp() {
+  const { mode } = useNodeState(state => ({ mode: state.mode }), shallow);
+  const theme = createTheme(getThemeOptions(mode));
+
+  return (
+    <ThemeProvider theme={theme}>
       <CssBaseline />
+      <ThemeInjector />
       <ReactFlowProvider>
         <Box sx={{
           display: 'flex',
@@ -77,5 +54,11 @@ createRoot(document.getElementById('root')!).render(
         </Box>
       </ReactFlowProvider>
     </ThemeProvider>
+  );
+}
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <ThemedApp />
   </StrictMode>
 )

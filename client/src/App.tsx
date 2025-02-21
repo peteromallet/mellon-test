@@ -1,14 +1,14 @@
 import { useEffect } from 'react';
 import { 
   ReactFlow,
-  //Controls,
   Background,
-  BackgroundVariant,
+  Controls,
   NodeOrigin,
-  useReactFlow,
+  Viewport,
   Connection,
-  IsValidConnection,
-  Viewport
+  Edge,
+  EdgeMouseHandler,
+  IsValidConnection
 } from '@xyflow/react';
 import { shallow } from 'zustand/shallow';
 import { useNodeState, NodeState, CustomNodeType, getLocalStorageKey } from './stores/nodeStore';
@@ -37,6 +37,9 @@ const selectNodeState = (state: NodeState) => ({
   addNode: state.addNode,
   getParam: state.getParam,
   loadWorkflowFromStorage: state.loadWorkflowFromStorage,
+  mode: state.mode,
+  viewport: state.viewport,
+  setViewport: state.setViewport,
 });
 
 const selectNodeRegistryState = (state: NodeRegistryState) => ({
@@ -61,11 +64,13 @@ export default function App() {
     addNode,
     getParam,
     loadWorkflowFromStorage,
+    mode,
+    viewport,
+    setViewport,
   } = useNodeState(selectNodeState, shallow);
   const { nodeRegistry, updateNodeRegistry } = useNodeRegistryState(selectNodeRegistryState, shallow);
   const { connect: connectWebsocket } = useWebsocketState(selectWebsocketState, shallow);
-  const { screenToFlowPosition, setViewport } = useReactFlow();
-
+  
   useEffect(() => {
     // Load workflow from localStorage and initialize other services
     loadWorkflowFromStorage();
@@ -75,12 +80,7 @@ export default function App() {
 
   // Save viewport position when it changes
   const onMoveEnd = (_: MouseEvent | TouchEvent | null, viewport: Viewport) => {
-    const { mode } = useNodeState.getState();
-    const key = getLocalStorageKey(mode);
-    const stored = localStorage.getItem(key) || '{}';
-    const data = JSON.parse(stored);
-    data.viewport = viewport;
-    localStorage.setItem(key, JSON.stringify(data));
+    setViewport(viewport);
   };
   
   // Handle drag & drop of workflow JSON
@@ -99,7 +99,14 @@ export default function App() {
 
       // Store the workflow in the appropriate localStorage key
       const key = getLocalStorageKey(flow.type);
-      localStorage.setItem(key, JSON.stringify(flow));
+      
+      // Ensure we preserve the viewport from the loaded file
+      const storedData = JSON.parse(localStorage.getItem(key) || '{}');
+      const newData = {
+        ...flow,
+        viewport: flow.viewport || storedData.viewport
+      };
+      localStorage.setItem(key, JSON.stringify(newData));
       
       // Now load it through the store which will handle setting the mode
       loadWorkflowFromStorage(flow.type);
@@ -107,104 +114,76 @@ export default function App() {
     reader.readAsText(file);
   };
 
-  // Normal DnD (adding nodes from sidebar)
+  // Handle drag and drop
   const onDragOver = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
-
-    if (event.dataTransfer.types.includes('Files')) {
-      event.dataTransfer.dropEffect = 'copy';
-      return;
-    }
     event.dataTransfer.dropEffect = 'move';
-  }
+  };
 
   const onDrop = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
 
-    // If a user dropped a .json file for the workflow
+    // Handle workflow JSON file drop
     if (event.dataTransfer.files.length > 0) {
       onWorkflowDrop(event);
       return;
     }
 
-    if (!nodeRegistry) return;
+    // Handle node drop
+    const nodeKey = event.dataTransfer.getData('text/plain');
+    if (!nodeKey || !nodeRegistry[nodeKey]) return;
 
-    const key = event.dataTransfer.getData('text/plain');
-    if (!key || !nodeRegistry[key]) return;
+    const node = nodeRegistry[nodeKey];
 
-    const nodeData = nodeRegistry[key];
-
-    const position = screenToFlowPosition({
-      x: event.clientX,
-      y: event.clientY,
-    });
-
-    const newNode = {
-      id: nanoid(),
-      type: 'custom', // for now we only have custom type
-      position,
-      data: nodeData,
+    // Get the position of the drop
+    const reactFlowBounds = event.currentTarget.getBoundingClientRect();
+    const position = {
+      x: event.clientX - reactFlowBounds.left,
+      y: event.clientY - reactFlowBounds.top,
     };
 
-    addNode(newNode as CustomNodeType);
-  }
+    addNode({
+      id: nodeKey + '-' + Math.random().toString(36).substr(2, 9),
+      type: 'custom',
+      position,
+      data: {
+        ...node,
+        execution_type: node.execution_type ?? 'workflow',  // Ensure execution_type is always defined
+        params: node.params ?? {},  // Ensure params is always defined
+      },
+    });
+  };
 
   const isValidConnection = (connection: Connection) => {
-    if (!connection.sourceHandle || !connection.targetHandle) return false;
-
-    // prevent self-loops
-    if (connection.source === connection.target) return false;
-
-    let sourceType = getParam(connection.source, connection.sourceHandle, 'type');
-    let targetType = getParam(connection.target, connection.targetHandle, 'type');
-    sourceType = Array.isArray(sourceType) ? sourceType : [sourceType];
-    sourceType.push('any');
-    targetType = Array.isArray(targetType) ? targetType : [targetType];
-
-    if (!sourceType.some((type: string) => targetType.includes(type))) return false;
-
     return true;
-  }
+  };
 
-  // Get stored viewport or use defaults
-  const defaultViewport = (() => {
-    const { mode } = useNodeState.getState();
-    const key = getLocalStorageKey(mode);
-    const stored = localStorage.getItem(key);
-    if (stored) {
-      const { viewport } = JSON.parse(stored);
-      if (viewport) {
-        return viewport;
-      }
-    }
-    return { x: 0, y: 0, zoom: 1 };
-  })();
+  const handleEdgeDoubleClick: EdgeMouseHandler = (event, edge) => {
+    onEdgeDoubleClick(edge.id);
+  };
 
   return (
     <ReactFlow
       nodes={nodes}
       edges={edges}
-      nodeTypes={nodeTypes}
       onNodesChange={onNodesChange}
       onEdgesChange={onEdgesChange}
-      onEdgeDoubleClick={(_, edge) => onEdgeDoubleClick(edge.id)}
-      isValidConnection={isValidConnection as IsValidConnection}
+      onEdgeDoubleClick={handleEdgeDoubleClick}
       onConnect={onConnect}
-      nodeOrigin={nodeOrigin}
-      onDragOver={onDragOver}
       onDrop={onDrop}
+      onDragOver={onDragOver}
       onMoveEnd={onMoveEnd}
-      edgesReconnectable={true}
-      defaultViewport={defaultViewport}
+      isValidConnection={isValidConnection as IsValidConnection}
+      nodeTypes={nodeTypes}
+      nodeOrigin={nodeOrigin}
+      viewport={viewport}
+      fitView={!viewport}
       minZoom={0.1}
-      maxZoom={1.2}
-      //connectionRadius={18}
-      //fitView
-      proOptions={{hideAttribution: true}}
-      deleteKeyCode={['Backspace', 'Delete']}      
+      maxZoom={2}
+      proOptions={{ hideAttribution: true }}
     >
-      {/* <Controls position="bottom-right" /> */}
-      <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="rgba(255, 255, 255, 0.3)" />
+      <Background />
+      <Controls />
     </ReactFlow>
   );
 }

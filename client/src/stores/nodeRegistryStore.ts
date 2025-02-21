@@ -1,5 +1,6 @@
 import { createWithEqualityFn } from 'zustand/traditional';
 import config from '../../config';
+import { NodeParams } from './nodeStore';
 
 type NodeType = {
     [key: string]: {
@@ -7,7 +8,8 @@ type NodeType = {
         module: string
         action: string
         category: string
-        params?: { [key: string]: any }
+        execution_type?: 'workflow' | 'button' | 'continuous'
+        params?: { [key: string]: NodeParams }
     }
 }
 

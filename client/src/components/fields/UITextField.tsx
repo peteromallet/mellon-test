@@ -21,7 +21,16 @@ const UITextField = ({
             <Box
                 component="pre"
                 data-key={fieldKey}
-                sx={{ color: theme.palette.text.secondary, backgroundColor: '#111', border: `1px solid ${theme.palette.divider}`, borderRadius: 1, padding: 1, m: 0, mb: 1, ...style }}
+                sx={{ 
+                    color: theme.palette.text.secondary, 
+                    backgroundColor: theme.palette.mode === 'light' ? '#ffffff' : '#111',
+                    border: `1px solid ${theme.palette.divider}`, 
+                    borderRadius: 1, 
+                    padding: 1, 
+                    m: 0, 
+                    mb: 1, 
+                    ...style 
+                }}
                 className={`${disabled ? 'mellon-disabled' : ''} ${hidden ? 'mellon-hidden' : ''}`}
             >
                 <Typography>{dataValue}</Typography>
