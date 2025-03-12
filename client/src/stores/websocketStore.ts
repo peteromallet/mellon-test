@@ -158,6 +158,13 @@ export const useWebsocketState = createWithEqualityFn<WebsocketState>((set, get)
                 }
                 useNodeState.getState().setParam(message.nodeId, message.key, message.data);
             }
+            else if (message.type === 'json') {
+                if (!message.nodeId || !message.key || !message.data) {
+                    console.error('Invalid json message. Ignoring.');
+                    return;
+                }
+                useNodeState.getState().setParam(message.nodeId, message.key, message.data);
+            }
             else if (message.type === 'executed') {
                 console.info('executed', message);
                 if (!message.nodeId) {

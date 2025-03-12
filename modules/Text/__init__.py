@@ -89,7 +89,7 @@ MODULE_MAP = {
             "timestamps_out": {
                 "label": "Timeline",
                 "type": "timeline",
-                "source": "timestamps",
+                "source": "timestamps_to_pass",
                 "display": "output",
                 
             }
@@ -120,8 +120,8 @@ MODULE_MAP = {
         "category": "text",
         "execution_type": "button",
         "params": {
-            "timestamps": {
-                "label": "Timestamps",
+            "data": {
+                "label": "Data",
                 "type": "timeline",
                 "display": "input"
             },
@@ -218,6 +218,82 @@ MODULE_MAP = {
                 "type": "string",                
                 "display": "ui_video",                          
                 "source": "file_to_play",
+            }
+        }
+    },
+    "Gallery": {
+        "label": "Gallery",
+        "description": "Gallery",
+        "type": "tool",
+        "category": "text",        
+        "execution_type": "button",
+        "params": {
+            "files": {
+                "label": "Files",
+                "type": "text",
+                "display": "input",
+            },
+            "gallery_out": {
+                "label": "Gallery",
+                "type": "json",                
+                "display": "ui_gallery",     
+                "source": "gallery_out",           
+            },
+            "file_out": {
+                "label": "Files",
+                "type": "file",
+                "display": "output",
+                "source": "gallery_out",
+            }
+
+        }
+    },
+    "ImageUploader": {
+        "label": "Image Uploader",
+        "description": "Upload images with prompts to a gallery",
+        "type": "tool",
+        "execution_type": "button",
+        "category": "text",
+        "params": {
+            "files": {
+                "label": "Upload Images",
+                "type": "text",
+                "display": "filebrowser",
+                "fileType": "image",                
+            },
+            "prompt": {
+                "label": "Image Prompt/Description",
+                "type": "text",                                                
+            },
+            "gallery_output": {
+                "label": "Gallery Output",
+                "type": "text",                
+                "display": "output"
+            }
+        }
+    },
+    "FluxWithLoRAs": {
+        "label": "Flux with LoRAs",
+        "description": "Flux with LoRAs",
+        "type": "tool",
+        "category": "text",
+        "execution_type": "button",
+        "params": {
+            "lora_url": {
+                "label": "LoRA URL",
+                "type": "string",
+                "display": "textarea",
+            },
+            "prompt": {
+                "label": "Prompt",
+                "type": "string",
+                "display": "textarea",
+            },
+            "image_out": {
+                "label": "Image",
+                "type": "text",
+                "display": "output",
+                "source": "image_out",
             }
         }
     }

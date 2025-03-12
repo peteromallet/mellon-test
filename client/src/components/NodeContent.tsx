@@ -26,6 +26,7 @@ import FileBrowserField from "./fields/FileBrowserField";
 import UITextField from "./fields/UITextField";
 import PomsSimpleTimeline from "./fields/PomsSimpleTimeline";
 import UIVideoPlayer from "./fields/UIVideoPlayer";
+import Gallery from "./fields/Gallery";
 
 // These are the props sent to the fields
 export type FieldProps = {
@@ -215,6 +216,8 @@ const FieldMemo = memo((props: FieldProps) => {
             return <PomsSimpleTimeline {...props} />;
         case 'ui_video':
             return <UIVideoPlayer {...props} />;
+        case 'ui_gallery':
+            return <Gallery {...props} />;
         default:
             return <TextField {...props} />;
     }
@@ -246,6 +249,8 @@ const getFieldType = (displayData: string, dataType: string, data: any) => {
             return 'ui_text';
         } else if (dataType.toLowerCase() === 'video') {
             return 'ui_video';
+        } else if (dataType.toLowerCase() === 'gallery') {
+            return 'ui_gallery';
         }
     }
 

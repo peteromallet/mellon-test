@@ -153,6 +153,8 @@ class WebServer:
     async def process_client_messages(self):
         while True:
             message = await self.client_queue.get()
+            print("LOOKIE HERE")
+            print(f"message: {message}")
             try:
                 await self.ws_clients[message["client_id"]].send_json(message["data"])
             except Exception as e:
@@ -245,7 +247,8 @@ class WebServer:
         return web.json_response(nodes)
     
     async def view(self, request):
-        allowed_formats = ['webp', 'png', 'jpeg', 'glb', 'text']
+        # Added "json" to allowed_formats so we can handle raw JSON
+        allowed_formats = ['webp', 'png', 'jpeg', 'glb', 'text', 'json']
 
         format = request.match_info.get('format', 'webp').lower()
         if format not in allowed_formats:
@@ -264,6 +267,7 @@ class WebServer:
         if value is None:
             raise web.HTTPNotFound(text=f"No data found for {key}")
         
+        # For convenience, keep value as a list if it is one:
         if not isinstance(value, list):
             value = [value]
 
@@ -279,13 +283,15 @@ class WebServer:
         filename = request.rel_url.query.get("filename", f"{key}_{index}.{format}")
 
         value = value[index]
-        if scale != 1:
-            from PIL.Image import Resampling
-            width = int(value.width * scale)
-            height = int(value.height * scale)
-            value = value.resize((max(width, 1), max(height, 1)), resample=Resampling.BICUBIC)
 
+        # If it's an image-like object:
         if format in ["webp","png","jpeg"]:
+            from PIL.Image import Resampling
+            if scale != 1:
+                width = int(value.width * scale)
+                height = int(value.height * scale)
+                value = value.resize((max(width, 1), max(height, 1)), resample=Resampling.BICUBIC)
+
             byte_arr = io.BytesIO()
             value.save(byte_arr, format=format.upper(), quality=quality)
             byte_arr = byte_arr.getvalue()
@@ -312,7 +318,12 @@ class WebServer:
                 }
             )
         elif format == "text":
-            return web.json_response({ "data": value })
+            # Existing "text" behavior (wrap in "data")
+            return web.json_response({"data": value})
+        elif format == "json":
+            # New "json" behavior: no wrapping
+            print(f"sent_to_client: {value}")
+            return web.json_response(value)
 
     async def clear_node_cache(self, request):
         data = await request.json()
@@ -427,10 +438,18 @@ class WebServer:
                     print(f"Source ID: {source_id}, Source Key: {source_key}")
 
                     # Adjusted logic to handle "ui_video" or "ui"
-                    if ("display" in params[p] and params[p]["display"] in ("ui", "ui_video")) or p.startswith("ui_"):
+                    print(f"Params: {params[p]}")
+                    if ("display" in params[p] and 
+                        (params[p]["display"] in ("ui", "ui_video") or 
+                         params[p]["display"].startswith("ui_"))):
                         print(f"UI field detected: {p} with type {params[p]['type']}")
-                        if params[p]["type"] in ("image", "3d", "text", "video"):
+                        if params[p]["type"] in ("image", "3d", "text", "video", "json"):
                             ui_fields[p] = { "source": source_key, "type": params[p]["type"] }
+                            # Also pass the value through to args if it has one
+                            if "value" in params[p]:
+                                args[p] = params[p]["value"]
+                            elif source_id:
+                                args[p] = self.node_store[source_id].output[source_key]
                     else:
                         if source_id and re.match(r".*\[\d+\]$", p):
                             print(f"List field detected: {p}")
@@ -447,7 +466,9 @@ class WebServer:
                                 else params[p].get("value")
                             )
                             print(f"Regular field: {p} = {args[p]}")
-
+                
+                # print the name of the node
+                print(f"\nNode name: {node}")
                 print(f"\nFinal arguments for node execution: {args}")
                 print(f"UI fields to update: {ui_fields}")
 
@@ -560,6 +581,7 @@ class WebServer:
                     print(f"\nProcessing UI field: {key}")
                     source = ui_fields[key]["source"]
                     source_value = self.node_store[node].output[source]
+                    print(f"Source value: {source_value}")
                     param_type = ui_fields[key]["type"].lower()
 
                     length = len(source_value) if isinstance(source_value, list) else 1
@@ -569,6 +591,8 @@ class WebServer:
                         format = 'glb'
                     elif param_type == "video":
                         format = 'mp4'
+                    elif param_type == "json":
+                        format = 'json'
                     else:
                         format = 'text'
 
@@ -610,7 +634,16 @@ class WebServer:
                             url = f"/view/{format}/{node}/{source}/{i}?t={time.time()}"
                             data.append({"url": url})
 
+                    elif format == 'json':
+                        # Provide a URL to /view/json/... plus the raw value
+                        data = {
+                            "url": f"/view/{format}/{node}/{source}/{0}?t={time.time()}",
+                            "value": source_value
+                        }
+
                     print(f"Sending UI update for {key} => data={data}")
+                    print(f"param_type={param_type}")
+                    print(f"node={node}")
                     await self.client_queue.put({
                         "client_id": sid,
                         "data": {
@@ -796,6 +829,7 @@ class WebServer:
     WebSocket API
     """
     async def websocket_handler(self, request):
+        
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         sid = request.query.get("sid")
@@ -810,8 +844,10 @@ class WebServer:
         await ws.send_json({"type": "welcome", "sid": sid})
 
         async for msg in ws:
+            print(f"msg: {msg}")
             if msg.type == WSMsgType.TEXT:
                 data = json.loads(msg.data)
+                print(f"data: {data}")
                 try:
                     if data["type"] == "ping":
                         await ws.send_json({"type": "pong"})
@@ -857,6 +893,7 @@ class WebServer:
         return re.sub(r'[^\w\s-]', '', text).strip().replace(' ', '-')
 
 
+# Then just instantiate the server as before.
 from modules import MODULE_MAP
 from config import config
 

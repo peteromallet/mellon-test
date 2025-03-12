@@ -7,6 +7,7 @@ import csv
 import glob
 import uuid
 import numpy as np
+import configparser
 from PIL import Image, ImageDraw, ImageFont
 from torch.cuda import synchronize
 from diffusers import FlowMatchEulerDiscreteScheduler, AutoencoderKL, FluxPriorReduxPipeline
@@ -16,6 +17,7 @@ from diffusers.utils import load_image
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
 from functools import wraps
 from typing import List, Dict, Tuple
+from huggingface_hub import login
 
 
 ##
@@ -39,8 +41,8 @@ class LoadAudio(NodeBase):
         return audio_file
 
 class Timeline(NodeBase):
-    def execute(self, audio_file, timestamps):
-        return {"audio_file_out": audio_file, "timestamps_out": timestamps}
+    def execute(self, audio_file, timestamps, timestamps_out=None):
+        return {"audio_file_out": audio_file, "timestamps_to_pass": timestamps, "timestamps_out": timestamps}
 
 class FluxTravelBase:
     """
@@ -73,6 +75,16 @@ class FluxTravelBase:
         """
         Sets up the pipeline objects (FluxPipeline, prior, etc.).
         """
+        # Read config and login to HuggingFace
+        config = configparser.ConfigParser()
+        config.read('config.ini')
+        
+        if 'huggingface' in config and 'token' in config['huggingface']:
+            hf_token = config['huggingface']['token']
+            login(token=hf_token)
+        else:
+            raise ValueError("HuggingFace token not found in config.ini")
+
         dtype = torch.bfloat16
         bfl_repo = "black-forest-labs/FLUX.1-schnell"
         revision = "refs/pr/1"
@@ -116,7 +128,11 @@ class FluxTravelBase:
 
         # Also load the Redux pipeline
         repo_redux = "black-forest-labs/FLUX.1-Redux-dev"
-        pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(repo_redux, torch_dtype=dtype)
+        pipe_prior_redux = FluxPriorReduxPipeline.from_pretrained(
+            repo_redux, 
+            torch_dtype=dtype,
+            use_auth_token=hf_token
+        )
         pipe_prior_redux = FluxTravelBase.add_timing_to_pipeline(pipe_prior_redux)
 
         return pipe, pipe_prior_redux, dtype
@@ -951,14 +967,13 @@ class FluxTravelPrecise(NodeBase):
         #    and from the audio start.
         # -----------------------
         first_time = filtered[0]['time']
-        # Shift so first time is 0
         for entry in filtered:
             entry['time'] -= first_time
 
         # We'll also set the audio start_time to `first_time`
         audio_file = data.get('audioFile', None)
         if audio_file:
-            audio_file = os.path.join("/data/files", audio_file)
+            audio_file = os.path.join(os.getcwd(), "data", "files", audio_file)
 
         # -----------------------
         # Build arrays for process_timestamped_images
@@ -967,7 +982,7 @@ class FluxTravelPrecise(NodeBase):
         times = []
         for entry in filtered:
             # If your actual images also reside in /data/files, do:
-            img_path = os.path.join("/data/files", entry['image'])
+            img_path = os.path.join(os.getcwd(), "data", "files", entry['image'])
             image_paths.append(img_path)
             times.append(entry['time'])
 
@@ -1087,3 +1102,172 @@ class DisplayText(NodeBase):
     def execute(self, text_in, text_in_2):
         return {"text_out": text_in + text_in_2}
 '''
+class Gallery(NodeBase):
+    def execute(self, files, gallery_out, file_out=None):
+        print("Gallery: Received new file:", files)
+        print("Gallery: Existing files:", gallery_out)
+        
+        # Get existing files from the nested params structure
+        existing_files = []
+        if isinstance(gallery_out, dict):
+            # Check if we have the nested 'value' structure
+            if 'value' in gallery_out:
+                value = gallery_out.get('value', {})
+                if isinstance(value, dict):
+                    params = value.get('params', {})
+                    if isinstance(params, dict):
+                        existing_files = params.get('files', [])
+            # Also check direct params structure as fallback
+            else:
+                params = gallery_out.get('params', {})
+                if isinstance(params, dict):
+                    existing_files = params.get('files', [])
+        
+        # If no new file is provided, return the existing gallery without adding a new entry
+        if files is None:
+            print("Gallery: No new file provided; returning existing gallery unchanged")
+            final_file_out = file_out if file_out is not None else ''
+            result = {
+                "gallery_out": {
+                    "params": {
+                        "component": "ui_gallery",
+                        "files": existing_files
+                    }
+                },
+                "file_out": str(final_file_out)
+            }
+            print("Gallery: Result:", result)
+            return result
+
+        # Get filename and strip data/files/ prefix if present
+        print("Gallery: Files:", files)
+        filename = files['file'] if isinstance(files, dict) else files
+        print("Gallery: Filename:", filename)
+        if isinstance(filename, str) and filename.startswith('data/files/'):
+            filename = filename.replace('data/files/', '')
+        print("Gallery: Filename:", filename)
+        # Create new file entry with the stripped filename
+        new_file = {
+            'filename': filename,
+            'starred': False,
+            'prompt': files.get('prompt', '') if isinstance(files, dict) else ''
+        }
+        
+        # Add new file to beginning of list
+        updated_files = [new_file] + existing_files
+                
+        # Determine final file_out using provided value if available
+        final_file_out = file_out if file_out is not None else filename
+        
+        # Return the params directly at the top level for the gallery
+        result = {
+            "gallery_out": {
+                "params": {
+                    "component": "ui_gallery",  # Changed from ImageGallery to ui_gallery
+                    "files": updated_files
+                }
+            },
+            "gallery_out2": {
+                "params": {
+                    "component": "ui_gallery",
+                    "files": updated_files
+                },
+            },
+            "file_out": str(final_file_out)  # ensure file_out is always present as a string
+        }
+
+        print("Gallery: Result:", result)
+        
+        return result
+
+class ImageUploader(NodeBase):
+    def execute(self, files, prompt=""):
+        output = {"gallery_output": {"file": files, "prompt": prompt}}
+        print(self)
+        print("ImageUploader: Output:", output)
+        return output
+
+class FluxWithLoRAs(NodeBase):
+    def execute(self, prompt, lora_url=None, image_out=None):
+        """
+        Generate an image using Flux with optional LoRA support via FAL API.
+        
+        Args:
+            prompt: Text prompt for image generation
+            lora_url: Optional URL to a LoRA model
+        
+        Returns:
+            Dictionary with the generated image path
+        """
+        try:
+            import fal_client
+            import requests
+            import uuid
+            import os
+            from PIL import Image
+            from io import BytesIO
+            
+            # Function to handle progress updates
+            def on_queue_update(update):
+                if isinstance(update, fal_client.InProgress):
+                    for log in update.logs:
+                        print(log["message"])
+            
+            # Prepare arguments
+            arguments = {
+                "prompt": prompt
+            }
+            
+            # Add LoRA URL if provided
+            if lora_url and lora_url.strip():
+                arguments["lora_url"] = lora_url.strip()
+                print(f"Using LoRA from: {lora_url}")
+            
+            # Include API key from environment variables
+            from dotenv import load_dotenv
+            load_dotenv()
+            fal_api_key = os.getenv("FAL_KEY")
+            print(f"FAL_KEY: {fal_api_key}")
+            print(f"Generating image with prompt: {prompt}")
+            
+            # Call the FAL API
+            result = fal_client.subscribe(
+                "fal-ai/flux-lora",
+                arguments=arguments,
+                with_logs=True,
+                on_queue_update=on_queue_update,
+            )
+            print(f"result: {result}")
+            
+            # Get the image URL from the result - FIXED to match actual response structure
+            # The response contains 'images' array with objects that have 'url' field
+            if 'images' in result and len(result['images']) > 0 and 'url' in result['images'][0]:
+                image_url = result['images'][0]['url']
+            else:
+                raise ValueError("No image URL in the response")
+            
+            # Download the image
+            response = requests.get(image_url)
+            if response.status_code != 200:
+                raise ValueError(f"Failed to download image: {response.status_code}")
+            
+            # Save the image to a file
+            img = Image.open(BytesIO(response.content))
+            filename = f"{uuid.uuid4()}.png"
+            output_path = os.path.join("data", "files", filename)
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            img.save(output_path)
+            
+            print(f"Image saved to: {output_path}")
+            
+            # Return the path to the saved image
+            output = {"image_out": {"file": output_path, "prompt": prompt}}
+            print("FluxWithLoRAs: Output:", output)
+            return output
+            
+        except ImportError as e:
+            print(f"Error: Required package not installed - {e}")
+            return {"error": f"Required package not installed: {e}"}
+        except Exception as e:
+            print(f"Error generating image: {e}")
+            return {"error": f"Error generating image: {e}"}
