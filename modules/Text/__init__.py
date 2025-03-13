@@ -289,10 +289,27 @@ MODULE_MAP = {
                 "type": "string",
                 "display": "textarea",
             },
+            "lora_strength": {
+                "label": "LoRA Strength",
+                "type": "number",
+                "default": 1.0,
+                "min": 0.0,
+                "max": 1.5,
+                "step": 0.01,
+                "display": "slider"
+            },
+            "images_per_prompt": {
+                "label": "Images Per Prompt",
+                "type": "number",
+                "default": 1,
+                "min": 1,
+                "max": 10,
+                "display": "slider"
+            },
             "image_out": {
                 "label": "Image",
                 "type": "text",
-                "display": "output",
+                "display": "output",                
                 "source": "image_out",
             }
         }

@@ -1110,14 +1110,12 @@ class Gallery(NodeBase):
         # Get existing files from the nested params structure
         existing_files = []
         if isinstance(gallery_out, dict):
-            # Check if we have the nested 'value' structure
             if 'value' in gallery_out:
                 value = gallery_out.get('value', {})
                 if isinstance(value, dict):
                     params = value.get('params', {})
                     if isinstance(params, dict):
                         existing_files = params.get('files', [])
-            # Also check direct params structure as fallback
             else:
                 params = gallery_out.get('params', {})
                 if isinstance(params, dict):
@@ -1139,31 +1137,52 @@ class Gallery(NodeBase):
             print("Gallery: Result:", result)
             return result
 
-        # Get filename and strip data/files/ prefix if present
+        # Process files parameter, supporting both single file and list of files
         print("Gallery: Files:", files)
-        filename = files['file'] if isinstance(files, dict) else files
-        print("Gallery: Filename:", filename)
-        if isinstance(filename, str) and filename.startswith('data/files/'):
-            filename = filename.replace('data/files/', '')
-        print("Gallery: Filename:", filename)
-        # Create new file entry with the stripped filename
-        new_file = {
-            'filename': filename,
-            'starred': False,
-            'prompt': files.get('prompt', '') if isinstance(files, dict) else ''
-        }
+        new_files = []
+        if isinstance(files, list):
+            for file_entry in files:
+                if isinstance(file_entry, dict):
+                    filename = file_entry.get('file') or file_entry.get('filename')
+                    prompt = file_entry.get('prompt', '')
+                else:
+                    filename = file_entry
+                    prompt = ''
+                if isinstance(filename, str) and filename.startswith('data/files/'):
+                    filename = filename.replace('data/files/', '')
+                print("Gallery: Filename:", filename)
+                new_files.append({
+                    'filename': filename,
+                    'starred': False,
+                    'prompt': prompt
+                })
+        else:
+            if isinstance(files, dict):
+                filename = files.get('file') or files.get('filename')
+                prompt = files.get('prompt', '')
+            else:
+                filename = files
+                prompt = ''
+            if isinstance(filename, str) and filename.startswith('data/files/'):
+                filename = filename.replace('data/files/', '')
+            print("Gallery: Filename:", filename)
+            new_files.append({
+                'filename': filename,
+                'starred': False,
+                'prompt': prompt
+            })
         
-        # Add new file to beginning of list
-        updated_files = [new_file] + existing_files
-                
+        # Add new files to the beginning of existing files
+        updated_files = new_files + existing_files
+        
         # Determine final file_out using provided value if available
-        final_file_out = file_out if file_out is not None else filename
+        final_file_out = file_out if file_out is not None else (new_files[0]['filename'] if new_files else '')
         
         # Return the params directly at the top level for the gallery
         result = {
             "gallery_out": {
                 "params": {
-                    "component": "ui_gallery",  # Changed from ImageGallery to ui_gallery
+                    "component": "ui_gallery",
                     "files": updated_files
                 }
             },
@@ -1188,17 +1207,7 @@ class ImageUploader(NodeBase):
         return output
 
 class FluxWithLoRAs(NodeBase):
-    def execute(self, prompt, lora_url=None, image_out=None):
-        """
-        Generate an image using Flux with optional LoRA support via FAL API.
-        
-        Args:
-            prompt: Text prompt for image generation
-            lora_url: Optional URL to a LoRA model
-        
-        Returns:
-            Dictionary with the generated image path
-        """
+    def execute(self, prompt, lora_url=None, lora_strength=1.0, images_per_prompt=1, image_out=None):
         try:
             import fal_client
             import requests
@@ -1214,10 +1223,8 @@ class FluxWithLoRAs(NodeBase):
                         print(log["message"])
             
             # Prepare arguments
-            arguments = {
-                "prompt": prompt
-            }
-            
+            arguments = {"prompt": prompt, "lora_strength": lora_strength}
+            print(f"lora_url: {lora_url}")
             # Add LoRA URL if provided
             if lora_url and lora_url.strip():
                 arguments["lora_url"] = lora_url.strip()
@@ -1230,41 +1237,40 @@ class FluxWithLoRAs(NodeBase):
             print(f"FAL_KEY: {fal_api_key}")
             print(f"Generating image with prompt: {prompt}")
             
-            # Call the FAL API
-            result = fal_client.subscribe(
-                "fal-ai/flux-lora",
-                arguments=arguments,
-                with_logs=True,
-                on_queue_update=on_queue_update,
-            )
-            print(f"result: {result}")
-            
-            # Get the image URL from the result - FIXED to match actual response structure
-            # The response contains 'images' array with objects that have 'url' field
-            if 'images' in result and len(result['images']) > 0 and 'url' in result['images'][0]:
-                image_url = result['images'][0]['url']
+            outputs = []
+            for i in range(int(images_per_prompt)):
+                result = fal_client.subscribe(
+                    "fal-ai/flux-lora",
+                    arguments=arguments,
+                    with_logs=True,
+                    on_queue_update=on_queue_update,
+                )
+                print(f"result: {result}")
+                if 'images' in result and len(result['images']) > 0 and 'url' in result['images'][0]:
+                    image_url = result['images'][0]['url']
+                else:
+                    raise ValueError("No image URL in the response")
+
+                response = requests.get(image_url)
+                if response.status_code != 200:
+                    raise ValueError(f"Failed to download image: {response.status_code}")
+                
+                img = Image.open(BytesIO(response.content))
+                filename = f"{uuid.uuid4()}.png"
+                output_path = os.path.join("data", "files", filename)
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                img.save(output_path)
+                print(f"Image saved to: {output_path}")
+                outputs.append({"file": output_path, "prompt": prompt})
+
+            if len(outputs) == 1:
+                final_output_data = outputs[0]
             else:
-                raise ValueError("No image URL in the response")
-            
-            # Download the image
-            response = requests.get(image_url)
-            if response.status_code != 200:
-                raise ValueError(f"Failed to download image: {response.status_code}")
-            
-            # Save the image to a file
-            img = Image.open(BytesIO(response.content))
-            filename = f"{uuid.uuid4()}.png"
-            output_path = os.path.join("data", "files", filename)
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            img.save(output_path)
-            
-            print(f"Image saved to: {output_path}")
-            
-            # Return the path to the saved image
-            output = {"image_out": {"file": output_path, "prompt": prompt}}
-            print("FluxWithLoRAs: Output:", output)
-            return output
-            
+                final_output_data = outputs
+
+            final_output = {"image_out": final_output_data}
+            print("FluxWithLoRAs: Output:", final_output)
+            return final_output
         except ImportError as e:
             print(f"Error: Required package not installed - {e}")
             return {"error": f"Required package not installed: {e}"}

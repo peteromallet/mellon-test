@@ -233,6 +233,13 @@ class NodeBase():
         return defaults
 
     def _has_changed(self, values):
+        # For tool-type nodes, always return True to force re-execution
+        if self.module_name in MODULE_MAP and self.class_name in MODULE_MAP[self.module_name]:
+            node_type = MODULE_MAP[self.module_name][self.class_name].get('type')
+            if node_type == 'tool' or (isinstance(node_type, list) and 'tool' in node_type):
+                return True
+
+        # For other nodes, check if values have changed
         return any(
             key not in self.params or
             are_different(self.params.get(key), values.get(key))

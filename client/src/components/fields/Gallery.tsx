@@ -416,61 +416,73 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
 
     console.log('[Gallery] => handleDrop => Found image files:', files.map((f) => f.name));
 
-    if (files.length === 0) return;
+    if (files.length > 0) {
+      try {
+        const newImages = await Promise.all(
+          files.map(async (file: File) => {
+            console.log('[Gallery] => handleDrop => uploading file:', file.name);
+            const formData = new FormData();
+            const timestamp = Date.now();
+            const fileName = `${timestamp}_${file.name}`;
+            formData.append('file', file, fileName);
 
-    try {
-      const newImages = await Promise.all(
-        files.map(async (file: File) => {
-          console.log('[Gallery] => handleDrop => uploading file:', file.name);
-          const formData = new FormData();
-          const timestamp = Date.now();
-          const fileName = `${timestamp}_${file.name}`;
-          formData.append('file', file, fileName);
+            const response = await fetch(`http://${config.serverAddress}/data/files`, {
+              method: 'POST',
+              body: formData,
+            });
+            if (!response.ok) {
+              throw new Error(`Failed to upload file: ${response.statusText}`);
+            }
 
-          const response = await fetch(`http://${config.serverAddress}/data/files`, {
-            method: 'POST',
-            body: formData,
-          });
-          if (!response.ok) {
-            throw new Error(`Failed to upload file: ${response.statusText}`);
+            const savedFileName = await response.text();
+            console.log('[Gallery] => handleDrop => server saved file as:', savedFileName);
+            return { filename: savedFileName, starred: false, prompt: '' };
+          })
+        );
+
+        console.log('[Gallery] => handleDrop => newImages:', newImages);
+        const updatedImages = [...originalOrder.current, ...newImages];
+        originalOrder.current = updatedImages;
+
+        newImages.forEach((image) => {
+          const baseFileName = image.filename.split('/').pop() || image.filename;
+          if (!imageUrls[baseFileName]) {
+            loadImage(image.filename);
           }
+        });
 
-          const savedFileName = await response.text();
-          console.log('[Gallery] => handleDrop => server saved file as:', savedFileName);
-          return { filename: savedFileName, starred: false, prompt: '' };
-        })
-      );
+        let filteredImages = showStarredOnly
+          ? updatedImages.filter((img) => img.starred)
+          : updatedImages;
+        filteredImages = sortOrder === 'newest' ? [...filteredImages].reverse() : [...filteredImages];
 
-      console.log('[Gallery] => handleDrop => newImages:', newImages);
-
-      const updatedImages = [...originalOrder.current, ...newImages];
-      originalOrder.current = updatedImages;
-
-      // For each newly added image, call loadImage
-      newImages.forEach((image) => {
-        const baseFileName = image.filename.split('/').pop() || image.filename;
-        if (!imageUrls[baseFileName]) {
-          loadImage(image.filename);
+        updateStore?.(fieldKey, { params: { component: 'ui_gallery', files: updatedImages } });
+        setDisplayedImages(filteredImages);
+      } catch (error) {
+        console.error('[Gallery] => handleDrop => Error handling dropped files:', error);
+      }
+    } else {
+      // Handle drop from another gallery (non-file drop)
+      const draggedUrl = e.dataTransfer.getData('text/plain');
+      const draggedFilename = e.dataTransfer.getData('drag-filename');
+      if (draggedUrl && draggedFilename) {
+        console.log('[Gallery] handleDrop => processing dragged image from another gallery');
+        const newImage = { filename: draggedFilename, starred: false, prompt: '' };
+        const updatedImages = [...originalOrder.current, newImage];
+        originalOrder.current = updatedImages;
+        const baseFileName = draggedFilename.includes('/') ? draggedFilename.split('/').pop() : draggedFilename;
+        if (baseFileName && !imageUrls[baseFileName]) {
+          loadImage(draggedFilename);
         }
-      });
-
-      // If showStarredOnly is turned on, exclude non-starred
-      let filteredImages = showStarredOnly
-        ? updatedImages.filter((img) => img.starred)
-        : updatedImages;
-
-      // Re-sort
-      const newSortedImages = (sortOrder === 'newest')
-        ? [...filteredImages].reverse()
-        : [...filteredImages];
-
-      // Persist new set of files to the store
-      const newValue = { params: { component: 'ui_gallery', files: updatedImages } };
-      updateStore?.(fieldKey, newValue);
-
-      setDisplayedImages(newSortedImages);
-    } catch (error) {
-      console.error('[Gallery] => handleDrop => Error handling dropped files:', error);
+        let filteredImages = showStarredOnly
+          ? updatedImages.filter((img) => img.starred)
+          : updatedImages;
+        filteredImages = sortOrder === 'newest' ? [...filteredImages].reverse() : [...filteredImages];
+        setDisplayedImages(filteredImages);
+        updateStore?.(fieldKey, { params: { component: 'ui_gallery', files: updatedImages } });
+      } else {
+        console.log('[Gallery] handleDrop => no valid dropped image data found');
+      }
     }
   };
 
