@@ -136,32 +136,31 @@ class NodeBase():
 
         execution_time = time.time()
 
-        if self._has_changed(values) or self._is_output_empty():
-            self.params.update(values)
+        self.params.update(values)
 
-            # delete previously loaded models
-            # TODO: delete a model only if something changed about it
-            if self._mm_model_ids:
-                memory_manager.delete_model(self._mm_model_ids, unload=self.FORCE_UNLOAD)
-                self._mm_model_ids = []
+        # delete previously loaded models
+        # TODO: delete a model only if something changed about it
+        if self._mm_model_ids:
+            memory_manager.delete_model(self._mm_model_ids, unload=self.FORCE_UNLOAD)
+            self._mm_model_ids = []
 
-            try:
-                params = { key: self.params[key] for key in self.params if not key.startswith('__') }
-                output = getattr(self, self.CALLBACK)(**params)
-            except Exception as e:
-                self.params = {}
-                self.output = get_module_output(self.module_name, self.class_name)
-                memory_flush(gc_collect=True)
-                raise e
+        try:
+            params = { key: self.params[key] for key in self.params if not key.startswith('__') }
+            output = getattr(self, self.CALLBACK)(**params)
+        except Exception as e:
+            self.params = {}
+            self.output = get_module_output(self.module_name, self.class_name)
+            memory_flush(gc_collect=True)
+            raise e
 
-            if isinstance(output, dict):
-                # Overwrite output values only for existing keys
-                #self.output.update({k: output[k] for k in self.output if k in output})
-                self.output = output
-            else:
-                # If only a single value is returned, assign it to the first output
-                first_key = next(iter(self.output))
-                self.output[first_key] = output
+        if isinstance(output, dict):
+            # Overwrite output values only for existing keys
+            #self.output.update({k: output[k] for k in self.output if k in output})
+            self.output = output
+        else:
+            # If only a single value is returned, assign it to the first output
+            first_key = next(iter(self.output))
+            self.output[first_key] = output
 
         self._execution_time = time.time() - execution_time
 

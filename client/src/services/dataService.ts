@@ -155,8 +155,11 @@ class DataService {
             method: 'DELETE'
         });
         
-        if (!response.ok) {
-            throw new Error(`Failed to delete node file: ${response.statusText}`);
+        if (response.status === 404) {
+            console.warn(`File ${fileName} not found, treating as deleted.`);
+        } else if (!response.ok) {
+            const bodyText = await response.text();
+            throw new Error(`Failed to delete node file: ${response.statusText} => ${bodyText}`);
         }
     }
 }

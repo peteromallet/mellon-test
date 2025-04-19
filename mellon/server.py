@@ -1,5 +1,3 @@
-import logging
-logger = logging.getLogger('mellon')
 from aiohttp import web, WSMsgType
 from aiohttp_cors import setup as cors_setup, ResourceOptions
 import json
@@ -92,7 +90,7 @@ class WebServer:
                 return
             self.is_shutting_down = True
             
-            logger.info("Received shutdown signal. Namárië!")
+            # logger.info("Received shutdown signal. Namárië!")
             self.shutdown_event.set()
 
             # Cancel all running tasks except the current one
@@ -153,12 +151,13 @@ class WebServer:
     async def process_client_messages(self):
         while True:
             message = await self.client_queue.get()
-            print("LOOKIE HERE")
-            print(f"message: {message}")
+            # print("LOOKIE HERE")
+            # print(f"message: {message}")
             try:
                 await self.ws_clients[message["client_id"]].send_json(message["data"])
             except Exception as e:
-                logger.error(f"Error sending client message: {str(e)}")
+                # logger.error(f"Error sending client message: {str(e)}")
+                pass # Silently ignore errors for now
             finally:
                 self.client_queue.task_done()
 
@@ -171,11 +170,11 @@ class WebServer:
                 else:
                     await self.graph_execution(item)
             except Exception as e:
-                logger.error(f"Error processing queue task: {str(e)}")
-                logger.error(f"Error occurred in {traceback.format_exc()}")
+                # logger.error(f"Error processing queue task: {str(e)}")
+                # logger.error(f"Error occurred in {traceback.format_exc()}")
                 await self.broadcast({
                     "type": "error",
-                    "error": "An unexpected error occurred while processing the graph"
+                    "error": f"An unexpected error occurred while processing the graph: {str(e)}"
                 })
             finally:
                 self.queue.task_done()
@@ -322,7 +321,7 @@ class WebServer:
             return web.json_response({"data": value})
         elif format == "json":
             # New "json" behavior: no wrapping
-            print(f"sent_to_client: {value}")
+            # print(f"sent_to_client: {value}")
             return web.json_response(value)
 
     async def clear_node_cache(self, request):
@@ -375,23 +374,23 @@ class WebServer:
             raise ValueError("Invalid action")
 
         if module.endswith(".custom"):
-            module = import_module(f"custom.{module.replace('.custom', '')}.{module.replace('.custom', '')}")
+            module_import = import_module(f"custom.{module.replace('.custom', '')}.{module.replace('.custom', '')}")
         else:
-            module = import_module(f"modules.{module}.{module}")
-        action = getattr(module, action)
+            module_import = import_module(f"modules.{module}.{module}")
+        action_func = getattr(module_import, action)
 
-        if not callable(action):
+        if not callable(action_func):
             raise ValueError("Action is not callable")
 
-        node = action()
-        node._client_id = sid
+        node_obj = action_func()
+        node_obj._client_id = sid
 
         result = {}
 
         try:
-            result = await self.event_loop.run_in_executor(None, lambda: node(**kwargs))
+            result = await self.event_loop.run_in_executor(None, lambda: node_obj(**kwargs))
         except Exception as e:
-            logger.error(f"Error executing node {module}.{action}: {str(e)}")
+            # logger.error(f"Error executing node {module}.{action}: {str(e)}")
             raise e
 
         await self.client_queue.put({
@@ -410,40 +409,48 @@ class WebServer:
         nodes = graph["nodes"]
         paths = graph["paths"]
         
-        print(f"\n=== Starting graph execution with SID: {sid} ===")
-        print(f"Number of nodes: {len(nodes)}")
-        print(f"Number of paths: {len(paths)}")
+        # print(f"\n=== Starting graph execution with SID: {sid} ===")
+        # print(f"Number of nodes: {len(nodes)}")
+        # print(f"Number of paths: {len(paths)}")
 
         randomized_fields = {}
         for path_index, path in enumerate(paths):
-            print(f"\n--- Processing path {path_index + 1}/{len(paths)} ---")
+            # print(f"\n--- Processing path {path_index + 1}/{len(paths)} ---")
             for node in path:
                 module_name = nodes[node]["module"]
                 action_name = nodes[node]["action"]
-                print(f"\nExecuting node: {node}")
-                print(f"Module: {module_name}, Action: {action_name}")
-                logger.debug(f"Executing node {module_name}.{action_name}")
+                # print(f"\nExecuting node: {node}")
+                # print(f"Module: {module_name}, Action: {action_name}")
+                # logger.debug(f"Executing node {module_name}.{action_name}")
 
                 old_output = deepcopy(self.node_store[node].output) if node in self.node_store else None
-                print(f"Previous output exists: {old_output is not None}")
+                # print(f"Previous output exists: {old_output is not None}")
 
                 params = nodes[node]["params"]
-                print(f"Parameters: {params}")
+                # print(f"Parameters: {params}")
                 ui_fields = {}
                 args = {}
+                # --> Added Print <--
+                print(f"[Server Debug Node {node}] Processing parameters. Full params dict being used: {params}")
                 for p in params:
+                    # --> Added Print <--
+                    print(f"[Server Debug Node {node}] Checking Param '{p}': Definition = {params[p]}")
                     source_id = params[p].get("sourceId")
                     source_key = params[p].get("sourceKey")
-                    print(f"\nProcessing parameter: {p}")
-                    print(f"Source ID: {source_id}, Source Key: {source_key}")
+                    # print(f"\nProcessing parameter: {p}")
+                    # print(f"Source ID: {source_id}, Source Key: {source_key}")
 
                     # Adjusted logic to handle "ui_video" or "ui"
-                    print(f"Params: {params[p]}")
+                    # print(f"Params: {params[p]}")
                     if ("display" in params[p] and 
                         (params[p]["display"] in ("ui", "ui_video") or 
                          params[p]["display"].startswith("ui_"))):
-                        print(f"UI field detected: {p} with type {params[p]['type']}")
+                        # --> Added Print <--
+                        print(f"[Server Debug Node {node}] Parameter '{p}' identified as potential UI field.")
+                        # print(f"UI field detected: {p} with type {params[p]['type']}")
                         if params[p]["type"] in ("image", "3d", "text", "video", "json"):
+                            # --> Added Print <--
+                            print(f"[Server Debug Node {node}] Parameter '{p}' type '{params[p]['type']}' is valid for UI update. Adding to ui_fields.")
                             ui_fields[p] = { "source": source_key, "type": params[p]["type"] }
                             # Also pass the value through to args if it has one
                             if "value" in params[p]:
@@ -452,7 +459,7 @@ class WebServer:
                                 args[p] = self.node_store[source_id].output[source_key]
                     else:
                         if source_id and re.match(r".*\[\d+\]$", p):
-                            print(f"List field detected: {p}")
+                            # print(f"List field detected: {p}")
                             spawn_key = re.sub(r"\[\d+\]$", "", p)
                             if not args.get(spawn_key):
                                 args[spawn_key] = []
@@ -465,27 +472,27 @@ class WebServer:
                                 if source_id
                                 else params[p].get("value")
                             )
-                            print(f"Regular field: {p} = {args[p]}")
+                            # print(f"Regular field: {p} = {args[p]}")
                 
                 # print the name of the node
-                print(f"\nNode name: {node}")
-                print(f"\nFinal arguments for node execution: {args}")
-                print(f"UI fields to update: {ui_fields}")
+                # print(f"\nNode name: {node}")
+                # print(f"\nFinal arguments for node execution: {args}")
+                # print(f"UI fields to update: {ui_fields}")
 
                 # Randomization
                 for key in args:
                     if key.startswith('__random__') and args[key] is True:
-                        print(f"\nRandomizing field: {key}")
+                        # print(f"\nRandomizing field: {key}")
                         if node not in randomized_fields:
                             randomized_fields[node] = []
                         if key in randomized_fields[node]:
-                            print(f"Field {key} already randomized, skipping")
+                            # print(f"Field {key} already randomized, skipping")
                             continue
                         randomized_fields[node].append(key)
                         random_field = key.split('__random__')[1]
                         args[random_field] = random.randint(0, (1<<53)-1)
                         params[random_field]["value"] = args[random_field]
-                        print(f"New random value for {random_field}: {args[random_field]}")
+                        # print(f"New random value for {random_field}: {args[random_field]}")
                         await self.client_queue.put({
                             "client_id": sid,
                             "data": {
@@ -502,15 +509,15 @@ class WebServer:
                     raise ValueError("Invalid action")
 
                 if module_name.endswith(".custom"):
-                    print(f"\nImporting custom module: {module_name}")
+                    # print(f"\nImporting custom module: {module_name}")
                     mod = import_module(f"custom.{module_name.replace('.custom', '')}.{module_name.replace('.custom', '')}")
                 else:
-                    print(f"\nImporting standard module: {module_name}")
+                    # print(f"\nImporting standard module: {module_name}")
                     mod = import_module(f"modules.{module_name}.{module_name}")
                 action = getattr(mod, action_name)
 
                 if node not in self.node_store:
-                    print(f"Initializing new node in store: {node}")
+                    # print(f"Initializing new node in store: {node}")
                     self.node_store[node] = action(node)
 
                 self.node_store[node]._client_id = sid
@@ -520,7 +527,7 @@ class WebServer:
                         f"Ensure that the class has a __call__ method or extend it from `NodeBase`."
                     )
 
-                print("\nStarting node execution...")
+                # print("\nStarting node execution...")
                 await self.client_queue.put({
                     "client_id": sid,
                     "data": {
@@ -538,20 +545,20 @@ class WebServer:
                             return None
 
                     result = await self.event_loop.run_in_executor(None, execute_node)
-                    print(f"Node execution completed with result type: {type(result)}")
+                    # print(f"Node execution completed with result type: {type(result)}")
                 except Exception as e:
-                    print(f"Error executing node: {str(e)}")
-                    logger.error(f"Error executing node {module_name}.{action_name}: {str(e)}")
+                    # print(f"Error executing node: {str(e)}")
+                    # logger.error(f"Error executing node {module_name}.{action_name}: {str(e)}")
                     raise e
 
                 exec_type = self.module_map[module_name][action_name].get("execution_type", "workflow")
-                print(f"\nExecution type: {exec_type}")
+                # print(f"\nExecution type: {exec_type}")
                 new_output = self.node_store[node].output
 
                 if exec_type == "continuous":
                     if not are_different(old_output, new_output):
-                        print("Output unchanged, skipping updates")
-                        logger.debug(f"Skipping updates for node {node} - output unchanged")
+                        # print("Output unchanged, skipping updates")
+                        # logger.debug(f"Skipping updates for node {node} - output unchanged")
                         execution_time = getattr(self.node_store[node], '_execution_time', 0)
                         await self.client_queue.put({
                             "client_id": sid,
@@ -564,7 +571,7 @@ class WebServer:
                         continue
 
                 execution_time = getattr(self.node_store[node], '_execution_time', 0)
-                print(f"Execution time: {execution_time:.2f}s")
+                # print(f"Execution time: {execution_time:.2f}s")
 
                 await self.client_queue.put({
                     "client_id": sid,
@@ -574,15 +581,24 @@ class WebServer:
                         "time": f"{execution_time:.2f}",
                     }
                 })
-                logger.debug(f"Node {module_name}.{action_name} executed in {execution_time:.3f}s")
+                # logger.debug(f"Node {module_name}.{action_name} executed in {execution_time:.3f}s")
+
+                # --> Added Print <--
+                print(f"[Server Debug] Node {node}: Just before UI field loop. ui_fields = {ui_fields}")
 
                 # Decide format based on node's type
                 for key in ui_fields:
-                    print(f"\nProcessing UI field: {key}")
+                    # print(f"\nProcessing UI field: {key}")
                     source = ui_fields[key]["source"]
+                    # --> Added Print <--
+                    print(f"[Server Debug] Node {node}: Processing UI field '{key}' linked to source '{source}'")
                     source_value = self.node_store[node].output[source]
-                    print(f"Source value: {source_value}")
+                    # print(f"Source value: {source_value}")
                     param_type = ui_fields[key]["type"].lower()
+                    
+                    # --> Added Print <--
+                    print(f"[Server Debug] Node {node}:   - Source value retrieved: {type(source_value)}") # Avoid printing potentially large value
+                    print(f"[Server Debug] Node {node}:   - Determined param_type: '{param_type}'")
 
                     length = len(source_value) if isinstance(source_value, list) else 1
                     if param_type == "image":
@@ -592,72 +608,50 @@ class WebServer:
                     elif param_type == "video":
                         format = 'mp4'
                     elif param_type == "json":
-                        format = 'json'
+                        format = 'json' # Assign format correctly
+                        # If the display type is specifically ui_promptlist,
+                        # send the raw list value directly.
+                        # Otherwise, use the standard URL/value structure.
+                        if params[key]["display"] == "ui_promptlist":
+                            data = source_value # Assign the raw list
+                            print(f"[Server Debug] Node {node}:   - Special handling for ui_promptlist: assigned raw value.")
+                        else:
+                            # Provide a URL to /view/json/... plus the raw value (default JSON behavior)
+                            data = {
+                                "url": f"/view/{format}/{node}/{source}/{0}?t={time.time()}",
+                                "value": source_value
+                            }
+                            print(f"[Server Debug] Node {node}:   - Default JSON handling: assigned URL+value structure.")
                     else:
                         format = 'text'
-
-                    print(f"Param type is '{param_type}', so using format='{format}'.  length={length}")
-
-                    data = None
-
-                    if format == 'text':
+                        # For text, assign data structure here directly
                         data = {
                             "url": f"/view/{format}/{node}/{source}/{0}?t={time.time()}",
                             "value": source_value
                         }
+                        print(f"[Server Debug] Node {node}:   - Text handling: assigned URL+value structure.")
 
-                    elif format == 'mp4':
-                        data = {
-                            "value": f"/view/{format}/{node}/{source}/{0}?t={time.time()}"
-                        }
-
-                    elif format == 'webp':
-                        data = []
-                        if not isinstance(source_value, list):
-                            source_value = [source_value]
-                        for i, val in enumerate(source_value):
-                            scale = 1
-                            if val.width > 1024 or val.height > 1024:
-                                scale = 0.5
-                            url = f"/view/{format}/{node}/{source}/{i}?scale={scale}&t={time.time()}"
-                            data.append({
-                                "url": url,
-                                "width": val.width,
-                                "height": val.height
-                            })
-
-                    elif format == 'glb':
-                        data = []
-                        if not isinstance(source_value, list):
-                            source_value = [source_value]
-                        for i, val in enumerate(source_value):
-                            url = f"/view/{format}/{node}/{source}/{i}?t={time.time()}"
-                            data.append({"url": url})
-
-                    elif format == 'json':
-                        # Provide a URL to /view/json/... plus the raw value
-                        data = {
-                            "url": f"/view/{format}/{node}/{source}/{0}?t={time.time()}",
-                            "value": source_value
-                        }
-
-                    print(f"Sending UI update for {key} => data={data}")
-                    print(f"param_type={param_type}")
-                    print(f"node={node}")
-                    await self.client_queue.put({
+                    # Construct and queue the message using the correctly assigned 'data'
+                    update_message = {
                         "client_id": sid,
                         "data": {
-                            "type": param_type,
-                            "key": key,
+                            "type": param_type, 
+                            "key": key,      
                             "nodeId": node,
-                            "data": data
+                            "data": data      
                         }
-                    })
+                    }
+                    # Check if data is None before logging/queuing, just in case
+                    if data is not None:
+                        print(f"[Server Debug] Node {node}: Queuing update message for UI field '{key}': {update_message['data']}")
+                        await self.client_queue.put(update_message)
+                    else:
+                        print(f"[Server Debug] Node {node}: WARNING - Data is None for UI field '{key}', skipping queue.")
 
                 await asyncio.sleep(0)
-                print(f"\n=== Completed node {node} ===")
+                # print(f"\n=== Completed node {node} ===")
 
-        print("\n=== Graph execution completed ===")
+        # print("\n=== Graph execution completed ===")
 
     async def list_files(self, request):
         path = request.query.get('path', '')
@@ -764,18 +758,18 @@ class WebServer:
             filename = request.match_info['filename']
             file_path = os.path.join(os.getcwd(), 'data', 'files', filename)
             
-            logger.info(f"Attempting to serve file: {file_path}")
+            # logger.info(f"Attempting to serve file: {file_path}")
             
             if not os.path.exists(file_path):
-                logger.error(f"File not found: {file_path}")
+                # logger.error(f"File not found: {file_path}")
                 raise web.HTTPNotFound(text=f"File not found: {filename}")
             
             if not os.access(file_path, os.R_OK):
-                logger.error(f"File not readable: {file_path}")
+                # logger.error(f"File not readable: {file_path}")
                 raise web.HTTPForbidden(text=f"File not readable: {filename}")
                 
             file_size = os.path.getsize(file_path)
-            logger.info(f"File exists and is readable. Size: {file_size} bytes")
+            # logger.info(f"File exists and is readable. Size: {file_size} bytes")
 
             if filename.lower().endswith('.mp4'):
                 with open(file_path, 'rb') as f:
@@ -791,7 +785,7 @@ class WebServer:
                         "Expires": "0"
                     }
                 )
-                logger.info("Serving MP4 file directly")
+                # logger.info("Serving MP4 file directly")
                 return response
             
             response = web.FileResponse(file_path)
@@ -800,13 +794,13 @@ class WebServer:
             response.headers["Expires"] = "0"
             response.headers["Content-Length"] = str(file_size)
             
-            logger.info(f"Serving file with headers: {dict(response.headers)}")
+            # logger.info(f"Serving file with headers: {dict(response.headers)}")
             return response
             
         except web.HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Error serving file: {str(e)}")
+            # logger.error(f"Error serving file: {str(e)}")
             raise web.HTTPInternalServerError(text=str(e))
 
     async def delete_file(self, request):
@@ -822,7 +816,7 @@ class WebServer:
         except web.HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Error deleting file: {str(e)}")
+            # logger.error(f"Error deleting file: {str(e)}")
             raise web.HTTPInternalServerError(text=str(e))
 
     """
@@ -833,7 +827,7 @@ class WebServer:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         sid = request.query.get("sid")
-        logger.info(f"WebSocket connection with sid {sid}")
+        # logger.info(f"WebSocket connection with sid {sid}")
         if sid:
             if sid in self.ws_clients:
                 del self.ws_clients[sid]
@@ -844,10 +838,10 @@ class WebServer:
         await ws.send_json({"type": "welcome", "sid": sid})
 
         async for msg in ws:
-            print(f"msg: {msg}")
+            # print(f"msg: {msg}")
             if msg.type == WSMsgType.TEXT:
                 data = json.loads(msg.data)
-                print(f"data: {data}")
+                # print(f"data: {data}")
                 try:
                     if data["type"] == "ping":
                         await ws.send_json({"type": "pong"})
@@ -857,13 +851,14 @@ class WebServer:
                     else:
                         raise ValueError("Invalid message type")
                 except Exception as e:
-                    logger.error(f"Unexpected error: {str(e)}")
+                    # logger.error(f"Unexpected error: {str(e)}")
                     await ws.send_json({"type": "error", "message": "An unexpected error occurred"})
             elif msg.type == WSMsgType.ERROR:
-                logger.error(f'WebSocket connection closed with exception {ws.exception()}')
+                # logger.error(f'WebSocket connection closed with exception {ws.exception()}')
+                pass # Silently ignore errors for now
 
         del self.ws_clients[sid]
-        logger.info(f'WebSocket connection {sid} closed')
+        # logger.info(f'WebSocket connection {sid} closed')
         return ws
 
     async def broadcast(self, message, client_id=None):

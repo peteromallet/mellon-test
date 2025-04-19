@@ -27,6 +27,8 @@ import UITextField from "./fields/UITextField";
 import PomsSimpleTimeline from "./fields/PomsSimpleTimeline";
 import UIVideoPlayer from "./fields/UIVideoPlayer";
 import Gallery from "./fields/Gallery";
+import PromptList from "./fields/PromptList";
+import LoraSelector from "./fields/LoraSelector";
 
 // These are the props sent to the fields
 export type FieldProps = {
@@ -213,11 +215,19 @@ const FieldMemo = memo((props: FieldProps) => {
         case 'ui_text':
             return <UITextField {...props} />;
         case 'ui_timeline':
-            return <PomsSimpleTimeline {...props} />;
+            return <PomsSimpleTimeline 
+                fieldKey={props.fieldKey}
+                value={props.value || { timestamps: [] }}
+                updateStore={(key: string, value: any) => props.updateStore?.(key, value)}
+            />;
         case 'ui_video':
             return <UIVideoPlayer {...props} />;
         case 'ui_gallery':
             return <Gallery {...props} />;
+        case 'ui_promptlist':
+            return <PromptList {...props} />;
+        case 'lora':
+            return <LoraSelector {...props} />;
         default:
             return <TextField {...props} />;
     }
@@ -238,6 +248,10 @@ const getFieldType = (displayData: string, dataType: string, data: any) => {
         return displayData === 'checkbox' || displayData === 'icontoggle' ? displayData : 'switch';
     }
 
+    if (displayData === 'lora') {
+        return 'lora';
+    }
+
     if (displayData === 'ui') {
         if (dataType === 'image') {
             return 'ui_image';
@@ -252,6 +266,10 @@ const getFieldType = (displayData: string, dataType: string, data: any) => {
         } else if (dataType.toLowerCase() === 'gallery') {
             return 'ui_gallery';
         }
+    }
+
+    if (displayData === 'ui_promptlist') {
+        return 'ui_promptlist';
     }
 
     if (displayData) {

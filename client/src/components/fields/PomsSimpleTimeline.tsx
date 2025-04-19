@@ -2261,6 +2261,24 @@ const PomsSimpleTimeline: React.FC<PomsSimpleTimelineProps> = ({
     setVisibleTimestamps(getVisibleTimestamps());
   }, [fallbackDuration]);
 
+  /* Auto-select timestamp when playhead passes it */
+  useEffect(() => {
+    if (isPlaying) {
+      const sortedTimestamps = [...timestamps].sort((a, b) => parseFloat(a.time) - parseFloat(b.time));
+      let currentStamp = null;
+      for (const stamp of sortedTimestamps) {
+        if (parseFloat(stamp.time) <= smoothCurrentTime) {
+          currentStamp = stamp;
+        } else {
+          break;
+        }
+      }
+      if (currentStamp && selectedTimestamp !== currentStamp.id) {
+        setSelectedTimestamp(currentStamp.id);
+      }
+    }
+  }, [smoothCurrentTime, isPlaying, timestamps, selectedTimestamp]);
+
   // --------------------- RENDER --------------------------
   return (
     <Card

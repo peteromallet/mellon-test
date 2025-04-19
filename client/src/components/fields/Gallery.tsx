@@ -1,5 +1,28 @@
-import React, { useEffect, useRef } from 'react';
-import { Box, ImageList, ImageListItem, IconButton, Select, MenuItem, FormControl, InputLabel, Button, Pagination, Skeleton, Fade, Modal, ToggleButtonGroup, ToggleButton, Dialog, DialogTitle, DialogContent, DialogActions, CircularProgress } from '@mui/material';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import {
+  Box,
+  ImageList,
+  ImageListItem,
+  IconButton,
+  Select,
+  MenuItem,
+  FormControl,
+  InputLabel,
+  Button,
+  Pagination,
+  TextField,
+  Skeleton,
+  Fade,
+  Modal,
+  ToggleButtonGroup,
+  ToggleButton,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  CircularProgress,
+  Tooltip
+} from '@mui/material';
 import DeleteIcon from '@mui/icons-material/Delete';
 import SortIcon from '@mui/icons-material/Sort';
 import CloseIcon from '@mui/icons-material/Close';
@@ -11,13 +34,14 @@ import CheckIcon from '@mui/icons-material/Check';
 import DeleteSweepIcon from '@mui/icons-material/DeleteSweep';
 import ChevronLeftIcon from '@mui/icons-material/ChevronLeft';
 import ChevronRightIcon from '@mui/icons-material/ChevronRight';
+import DownloadIcon from '@mui/icons-material/Download';
+import InfoIcon from '@mui/icons-material/Info';
 
 import { useNodeState } from '../../stores/nodeStore';
 import dataService from '../../services/dataService';
 import config from '../../../config';
 import { FieldProps } from '../NodeContent'; // Standard Mellon FieldProps import
 
-// Just for clarity, these types are the same:
 interface ImageObject {
   filename: string;
   starred: boolean;
@@ -34,13 +58,20 @@ interface GalleryData {
       filename?: string;
     };
     imageSize?: string;
+    sortOrder?: 'newest' | 'oldest' | 'custom';
+    itemsPerPage?: number;
+    numColumns?: number;
+    page?: number;
+    showStarredOnly?: boolean;
+    searchTerm?: string;
   };
-  files?: string[]; // Fallback if no params?.files
+  files?: string[];
 }
 
 interface SelectedImage {
   url: string;
   prompt: string;
+  isVideo?: boolean;
 }
 
 const ITEMS_PER_PAGE_OPTIONS = [16, 32, 64, 128];
@@ -54,13 +85,13 @@ const COLUMNS_OPTIONS = [2, 3, 4, 5, 6];
 type ImageSize = keyof typeof IMAGE_SIZES;
 
 const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore }: FieldProps) => {
-  // First, log what we are receiving in `value`.
   console.log('[Gallery] Rendering. Props fieldKey=', fieldKey);
-  console.log('[Gallery] The `value` prop is:', value);
+  console.log('[Gallery] The value prop is:', value);
 
-  // Parse the incoming value into a typed structure
-  const galleryData: GalleryData = (value && typeof value === 'object' ? ((value as any).value || value) : {}) as GalleryData;
-  console.log('[Gallery] Computed galleryData =', galleryData);
+  const galleryData: GalleryData =
+    value && typeof value === 'object'
+      ? ((value as any).value || value)
+      : ({} as GalleryData);
 
   const imageRefs = useRef<Record<string, HTMLImageElement>>({});
   const originalOrder = useRef<ImageObject[]>([]);
@@ -70,127 +101,277 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
   const [isDeletingImage, setIsDeletingImage] = React.useState<number | null>(null);
   const [imageUrls, setImageUrls] = React.useState<Record<string, string>>({});
   const [displayedImages, setDisplayedImages] = React.useState<ImageObject[]>([]);
-  const [sortOrder, setSortOrder] = React.useState<'newest' | 'oldest' | 'custom'>('newest');
-  const [itemsPerPage, setItemsPerPage] = React.useState(16);
-  const [numColumns, setNumColumns] = React.useState(4);
-  const [page, setPage] = React.useState(1);
+  const [sortOrder, setSortOrder] = React.useState<'newest' | 'oldest' | 'custom'>(
+    galleryData?.params?.sortOrder || 'oldest'
+  );
+  const [itemsPerPage, setItemsPerPage] = React.useState(
+    galleryData?.params?.itemsPerPage || 16
+  );
+  const [numColumns, setNumColumns] = React.useState(
+    galleryData?.params?.numColumns || 4
+  );
+  const [page, setPage] = React.useState(
+    galleryData?.params?.page || 1
+  );
   const [loadedImages, setLoadedImages] = React.useState<Record<string, boolean>>({});
   const [selectedImage, setSelectedImage] = React.useState<SelectedImage | null>(null);
 
-  const [imageSize, setImageSize] = React.useState<ImageSize>((galleryData?.params?.imageSize as ImageSize) || 'small');
+  // Index of the currently selected image within the *displayed* images
+  const [selectedImageIndex, setSelectedImageIndex] = useState<number | null>(null);
+
+  // Local states for editing the prompt
+  const [editedPrompt, setEditedPrompt] = useState('');
+  const [originalPrompt, setOriginalPrompt] = useState('');
+
+  const [searchTerm, setSearchTerm] = React.useState(
+    galleryData?.params?.searchTerm || ''
+  );
+
+  const [imageSize, setImageSize] = React.useState<ImageSize>(
+    (galleryData?.params?.imageSize as ImageSize) || 'small'
+  );
   const [isDraggingOver, setIsDraggingOver] = React.useState(false);
   const [starredImages, setStarredImages] = React.useState<Set<string>>(new Set());
-  const [showStarredOnly, setShowStarredOnly] = React.useState(false);
+  const [showStarredOnly, setShowStarredOnly] = React.useState(
+    galleryData?.params?.showStarredOnly || false
+  );
   const [copySuccess, setCopySuccess] = React.useState(false);
   const [deleteNonStarredDialogOpen, setDeleteNonStarredDialogOpen] = React.useState(false);
   const [isDeletingNonStarred, setIsDeletingNonStarred] = React.useState(false);
+  const [isDraggingMedia, setIsDraggingMedia] = React.useState(false);
+  const [thumbnailCopySuccess, setThumbnailCopySuccess] = React.useState<Record<string, boolean>>({});
 
-  // Debug when `galleryData` changes
+  const mediaRef = useRef<HTMLImageElement | HTMLVideoElement | null>(null);
+  const promptInputRef = useRef<HTMLInputElement>(null);
+  const [mediaWidth, setMediaWidth] = useState<number>(0);
+
+  const dragCounter = useRef(0);
+
+  // Whenever selectedImage changes, set up the local prompt states.
   useEffect(() => {
-    console.log('[Gallery] useEffect: `galleryData` changed:', galleryData);
+    if (selectedImage) {
+      setEditedPrompt(selectedImage.prompt || '');
+      setOriginalPrompt(selectedImage.prompt || '');
+    } else {
+      setEditedPrompt('');
+      setOriginalPrompt('');
+    }
+  }, [selectedImage]);
+
+  // Effect to set cursor position in prompt input when modal opens
+  useEffect(() => {
+    // When the modal opens (selectedImage is set)
+    if (selectedImage) {
+      console.log('[Gallery] useEffect for cursor: selectedImage is set, scheduling focus attempt.');
+      // Use a timeout to ensure the autoFocus/mounting has likely completed
+      // and the element is ready for selection manipulation.
+      const timer = setTimeout(() => {
+        console.log('[Gallery] setTimeout callback: Checking ref...');
+        // Check for the ref *inside* the timeout
+        if (promptInputRef.current) {
+          console.log('[Gallery] setTimeout callback: Ref exists.');
+          const length = promptInputRef.current.value.length;
+          console.log(`[Gallery] setTimeout callback: Prompt length is ${length}.`);
+          console.log('[Gallery] setTimeout callback: Calling focus().');
+          promptInputRef.current.focus(); // Ensure focus first
+          console.log('[Gallery] setTimeout callback: Calling setSelectionRange().');
+          promptInputRef.current.setSelectionRange(length, length);
+          console.log('[Gallery] Prompt input focused, cursor set to end.');
+        } else {
+          console.log('[Gallery] setTimeout callback: Ref was null!');
+        }
+      }, 100); // Increased delay slightly just in case
+
+      return () => {
+        console.log('[Gallery] Cleanup: Clearing timeout.');
+        clearTimeout(timer);
+      };
+    } else {
+        console.log('[Gallery] useEffect for cursor: selectedImage is null, effect skipped.');
+    }
+  }, [selectedImage]);
+
+  const updateMediaWidth = useCallback(() => {
+    if (mediaRef.current) {
+      setMediaWidth(mediaRef.current.offsetWidth);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (selectedImage) {
+      setMediaWidth(0);
+      const observer = new ResizeObserver(updateMediaWidth);
+      if (mediaRef.current) {
+        observer.observe(mediaRef.current);
+      }
+      return () => observer.disconnect();
+    }
+  }, [selectedImage, updateMediaWidth]);
+
+  const isVideoFile = (filename: string): boolean => {
+    const lower = filename.toLowerCase();
+    return lower.endsWith('.mp4') || lower.endsWith('.webm') || lower.endsWith('.ogg');
+  };
+
+  useEffect(() => {
+    console.log('[Gallery] useEffect: galleryData changed:', galleryData);
   }, [galleryData]);
 
-  // Track successful generations (if that's relevant)
+  /**
+   * If a new image has been generated (params.output.success && params.output.filename),
+   * we add it to the gallery and force "oldest" sort so it shows up last.
+   */
   useEffect(() => {
     if (galleryData?.params?.output?.success && galleryData?.params?.output?.filename) {
-      lastGeneratedImage.current = galleryData.params.output.filename;
-      console.log('[Gallery] useEffect: Detected a newly generated image =>', lastGeneratedImage.current);
+      const newFilename = galleryData.params.output.filename;
+      console.log('[Gallery] useEffect: Detected a newly generated image =>', newFilename);
+
+      // If that file isn't already in our gallery, add it:
+      const alreadyExists = originalOrder.current.some(img => img.filename === newFilename);
+      if (!alreadyExists) {
+        const newObj: ImageObject = {
+          filename: newFilename,
+          starred: false,
+          prompt: ''
+        };
+        originalOrder.current.push(newObj);
+
+        // Load the new file
+        loadImage(newFilename);
+
+        // Force sort to oldest & jump to last page
+        setSortOrder('oldest');
+        const sorted = refreshDisplayedImages(originalOrder.current);
+        const totalPages = Math.ceil(sorted.length / itemsPerPage);
+        setPage(totalPages);
+
+        // Save to store
+        updateSettingsInStore({
+          files: originalOrder.current,
+          sortOrder: 'oldest',
+          page: totalPages
+        });
+      }
     }
   }, [galleryData]);
 
-  // Main effect to parse galleryData and set displayedImages
+  // Function to re-filter, re-sort, and then set displayedImages in one place
+  const refreshDisplayedImages = useCallback(
+    (sourceArray: ImageObject[]) => {
+      // 1) Filter if showStarredOnly
+      let filtered = showStarredOnly
+        ? sourceArray.filter((img) => img.starred)
+        : [...sourceArray];
+
+      // 2) Filter by searchTerm
+      if (searchTerm.trim() !== '') {
+        filtered = filtered.filter(
+          (img: ImageObject) =>
+            (img.prompt && img.prompt.toLowerCase().includes(searchTerm.toLowerCase())) ||
+            (img.filename && img.filename.toLowerCase().includes(searchTerm.toLowerCase()))
+        );
+      }
+
+      // 3) Sort
+      // 'newest' means the last in original order is shown first, so reverse the array
+      let sorted = sortOrder === 'newest' ? [...filtered].reverse() : [...filtered];
+
+      setDisplayedImages(sorted);
+      return sorted;
+    },
+    [showStarredOnly, searchTerm, sortOrder]
+  );
+
+  // load images from either params.files or fallback to galleryData.files
   useEffect(() => {
     console.log('[Gallery] useEffect: reading files from galleryData.params.files or galleryData.files');
 
-    // The array of images stored in either params.files or fallback to galleryData.files
-    const savedImages: ImageObject[] = Array.isArray(galleryData?.params?.files)
-      ? galleryData.params.files
-      : Array.isArray(galleryData?.files)
-        ? galleryData.files.map((filename: string) => ({
-            filename,
-            starred: false,
-            prompt: ''
-          }))
-        : [];
+    let savedImages: ImageObject[] = [];
+    
+    // Only update from galleryData if it actually has files
+    if (galleryData?.params?.files && Array.isArray(galleryData.params.files) && galleryData.params.files.length > 0) {
+      savedImages = galleryData.params.files;
+      originalOrder.current = savedImages;
+    } else if (galleryData?.files && Array.isArray(galleryData.files) && galleryData.files.length > 0) {
+      savedImages = galleryData.files.map((filename: string) => ({
+        filename,
+        starred: false,
+        prompt: ''
+      }));
+      originalOrder.current = savedImages;
+    }
+    // If galleryData has no files but we have local files, keep using those
+    else if (originalOrder.current.length > 0) {
+      savedImages = originalOrder.current;
+    }
 
-    console.log('[Gallery] => savedImages length:', savedImages.length);
+    console.log('[Gallery] => computed savedImages length:', savedImages.length);
 
-    // Update originalOrder in a ref
-    originalOrder.current = savedImages;
-
-    // Start loading images (calls loadImage for any not in state)
-    savedImages.forEach((imageObj: ImageObject) => {
-      const baseFileName = imageObj.filename.includes('/')
-        ? imageObj.filename.split('/').pop()
-        : imageObj.filename;
-
+    // Load any images that aren't already loaded
+    savedImages.forEach((img) => {
+      const baseFileName = img.filename.includes('/') ? img.filename.split('/').pop() : img.filename;
       if (baseFileName && !imageUrls[baseFileName]) {
-        loadImage(imageObj.filename);
+        loadImage(img.filename);
       }
     });
 
-    // Filter if showStarredOnly is turned on
-    let filteredImages = showStarredOnly
-      ? savedImages.filter((img: ImageObject) => img.starred)
-      : savedImages;
-
-    // Then sort
-    const sortedImages = (sortOrder === 'newest')
-      ? [...filteredImages].reverse()
-      : [...filteredImages];
-
-    setDisplayedImages(sortedImages);
+    refreshDisplayedImages(savedImages);
   }, [
     galleryData?.files,
     galleryData?.params?.files,
     imageUrls,
     showStarredOnly,
     sortOrder,
+    searchTerm,
+    refreshDisplayedImages
   ]);
 
-  // Optional: an effect to track changes to displayedImages
-  useEffect(() => {
-    console.log('[Gallery] useEffect: displayedImages changed:', displayedImages);
-  }, [displayedImages]);
-
-  // Optional: separate effect for imageUrls updates
-  useEffect(() => {
-    console.log('[Gallery] useEffect: imageUrls changed: total keys=', Object.keys(imageUrls).length, imageUrls);
-  }, [imageUrls]);
-
-  // If the node allows specifying a default image size in params, capture that
   useEffect(() => {
     if (
       galleryData?.params?.imageSize &&
       (galleryData.params.imageSize === 'small' ||
-       galleryData.params.imageSize === 'medium' ||
-       galleryData.params.imageSize === 'large')
+        galleryData.params.imageSize === 'medium' ||
+        galleryData.params.imageSize === 'large')
     ) {
-      console.log('[Gallery] useEffect: Setting imageSize from galleryData:', galleryData.params.imageSize);
       setImageSize(galleryData.params.imageSize as ImageSize);
     }
   }, [galleryData?.params?.imageSize]);
 
+  const updateSettingsInStore = (updates: Partial<GalleryData['params']>) => {
+    console.log('[Gallery updateSettingsInStore] Preparing to update store with updates:', updates);
+    const newValue = {
+      params: {
+        ...((galleryData && galleryData.params) || {}),
+        component: 'ui_gallery',
+        files: originalOrder.current,
+        ...updates
+      }
+    };
+    console.log('[Gallery updateSettingsInStore] Constructed newValue:', newValue);
+    if (updateStore) {
+        console.log('[Gallery updateSettingsInStore] Calling updateStore prop function.');
+        updateStore(fieldKey, newValue);
+    } else {
+        console.error('[Gallery updateSettingsInStore] Error: updateStore prop is missing!');
+    }
+  };
+
+  /**
+   * We change the labeling to reflect the current sort mode:
+   * If sortOrder === 'newest', the button text will read "Newest First".
+   * If 'oldest', it will read "Oldest First".
+   */
   const handleSortChange = (event: any, newSortOrder: 'newest' | 'oldest' | 'custom') => {
     if (newSortOrder !== null) {
-      console.log('[Gallery] handleSortChange => newSortOrder:', newSortOrder);
       setSortOrder(newSortOrder);
-
-      let filteredImages = showStarredOnly
-        ? originalOrder.current.filter((img: ImageObject) => img.starred)
-        : [...originalOrder.current];
-
-      const sortedImages = (newSortOrder === 'newest')
-        ? [...filteredImages].reverse()
-        : [...filteredImages];
-
-      setDisplayedImages(sortedImages);
+      refreshDisplayedImages(originalOrder.current);
+      updateSettingsInStore({ sortOrder: newSortOrder });
     }
   };
 
   const handlePageChange = (event: any, value: number) => {
-    console.log('[Gallery] handlePageChange => page:', value);
     setPage(value);
+    updateSettingsInStore({ page: value });
   };
 
   const totalPages = Math.ceil(displayedImages.length / itemsPerPage);
@@ -199,31 +380,21 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
     page * itemsPerPage
   );
 
-  // Attempt to load an image from /data/files
   const loadImage = async (imageName: string): Promise<string | null> => {
     try {
-      console.log('[Gallery] loadImage called for:', imageName);
       const baseFileName = imageName.includes('/')
         ? imageName.split('/').pop()
         : imageName;
       if (!baseFileName) {
-        console.warn('[Gallery] loadImage => baseFileName is empty, skipping');
         return null;
       }
-
       const imageUrl = `http://${config.serverAddress}/data/files/${baseFileName}`;
-      console.log('[Gallery] => generated imageUrl:', imageUrl);
-
-      // Immediately store this in state to force a re-render
       setImageUrls((prev) => {
         if (prev[baseFileName]) {
-          console.log('[Gallery] => imageUrl already in state, skipping');
           return prev;
         }
-        console.log('[Gallery] => adding new imageUrl to state for', baseFileName);
         return { ...prev, [baseFileName]: imageUrl };
       });
-
       return imageUrl;
     } catch (error) {
       console.error('[Gallery] Error in loadImage:', error);
@@ -232,59 +403,40 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
   };
 
   const handleDelete = async (index: number): Promise<void> => {
-    // Because of pagination, compute the index in displayedImages
     const actualIndex = (page - 1) * itemsPerPage + index;
-    console.log('[Gallery] handleDelete => Attempting to delete index:', actualIndex);
     if (isDeletingImage === actualIndex) return;
     setIsDeletingImage(actualIndex);
 
     try {
       const imageObj = displayedImages[actualIndex];
       if (!imageObj) {
-        console.warn('[Gallery] handleDelete => No image object at that index');
         return;
       }
       const filename = imageObj.filename;
       const baseFilename = filename.includes('/') ? filename.split('/').pop() : filename;
 
       if (baseFilename) {
-        // Remove from local state
         setImageUrls((prev) => {
           const newUrls = { ...prev };
           delete newUrls[baseFilename];
           return newUrls;
         });
 
-        // Actually remove from the server
         try {
           await dataService.deleteNodeFile(galleryData.nodeId || '', baseFilename);
         } catch (err) {
           console.error('[Gallery] handleDelete => Error deleting file from server:', err);
         }
 
-        // Filter out the deleted file from originalOrder
-        originalOrder.current = originalOrder.current.filter((img) => img.filename !== filename);
+        originalOrder.current = originalOrder.current.filter(
+          (img) => img.filename !== filename
+        );
 
-        // Re-filter and sort the displayed images
-        let newDisplayedImages = showStarredOnly
-          ? originalOrder.current.filter((img: ImageObject) => img.starred)
-          : [...originalOrder.current];
+        refreshDisplayedImages(originalOrder.current);
 
-        newDisplayedImages = (sortOrder === 'newest')
-          ? [...newDisplayedImages].reverse()
-          : [...newDisplayedImages];
-
-        setDisplayedImages(newDisplayedImages);
-
-        // Let the store know that the param changed
-        const newValue = {
-          params: {
-            component: 'ui_gallery',
-            files: originalOrder.current
-          }
-        };
-        updateStore?.(fieldKey, newValue);
-        console.log('[Gallery] handleDelete => updated store after deletion');
+        updateSettingsInStore({
+          files: originalOrder.current,
+        });
       }
     } finally {
       setIsDeletingImage(null);
@@ -292,12 +444,10 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
   };
 
   const handleDragStart = (e: React.DragEvent, index: number) => {
-    console.log('[Gallery] handleDragStart => index:', index);
-    // Because of pagination, compute the index in displayedImages
+    setIsDraggingMedia(true);
     const actualIndex = (page - 1) * itemsPerPage + index;
     const imageObj = displayedImages[actualIndex];
     if (!imageObj || !imageObj.filename) {
-      console.warn('[Gallery] handleDragStart => invalid imageObj:', imageObj);
       return;
     }
     const filename = imageObj.filename;
@@ -308,29 +458,196 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
       dt.effectAllowed = 'copy';
       dt.setData('text/plain', url);
       dt.setData('drag-filename', filename);
-      const img = e.currentTarget as HTMLImageElement;
-      dt.setDragImage(img, img.width / 2, img.height / 2);
+      dt.setData('drag-prompt', imageObj.prompt);
+
+      const img = e.currentTarget as HTMLElement;
+      if (img && img instanceof HTMLImageElement) {
+        dt.setDragImage(img, img.width / 2, img.height / 2);
+      }
     }
   };
 
   const handleImageLoad = (baseFilename: string) => {
-    console.log('[Gallery] handleImageLoad => loaded:', baseFilename);
     setLoadedImages((prev) => ({ ...prev, [baseFilename]: true }));
   };
 
-  const handleImageDoubleClick = (imageUrl: string, imageObj: ImageObject) => {
-    console.log('[Gallery] handleImageDoubleClick => opening modal for:', imageUrl);
-    setSelectedImage({ url: imageUrl, prompt: imageObj.prompt });
+  /**
+   * Save the current `editedPrompt` back to the correct image in `originalOrder`.
+   * Only do so if the user actually changed it.
+   */
+  const savePrompt = useCallback(() => {
+    console.log('[Gallery savePrompt] Attempting to save prompt.');
+    if (selectedImageIndex === null || selectedImageIndex < 0) {
+      console.log('[Gallery savePrompt] Aborted: selectedImageIndex is invalid.', selectedImageIndex);
+      return;
+    }
+    if (editedPrompt !== originalPrompt) {
+      console.log(`[Gallery savePrompt] Prompt changed from "${originalPrompt}" to "${editedPrompt}". Proceeding with save.`);
+      // Find the actual global index of the displayed image
+      const actualIndex = (page - 1) * itemsPerPage + selectedImageIndex;
+      if (actualIndex >= 0 && actualIndex < displayedImages.length) {
+        const displayedImg = displayedImages[actualIndex];
+        console.log('[Gallery savePrompt] Found displayed image:', displayedImg);
+        // Find same image in originalOrder to update
+        const globalIndex = originalOrder.current.findIndex(
+          (img) => img.filename === displayedImg.filename
+        );
+        if (globalIndex >= 0) {
+          console.log('[Gallery savePrompt] Found image in originalOrder at index:', globalIndex);
+          originalOrder.current[globalIndex] = {
+            ...originalOrder.current[globalIndex],
+            prompt: editedPrompt,
+          };
+          // Update store so data is persisted
+          console.log('[Gallery savePrompt] Calling updateSettingsInStore.');
+          updateSettingsInStore({ files: originalOrder.current });
+          // Refresh the displayed images so the updated prompt shows immediately
+          refreshDisplayedImages(originalOrder.current);
+        } else {
+          console.error('[Gallery savePrompt] Error: Could not find image in originalOrder.current:', displayedImg.filename);
+        }
+      } else {
+         console.error('[Gallery savePrompt] Error: actualIndex is out of bounds:', actualIndex);
+      }
+    } else {
+      console.log('[Gallery savePrompt] Prompt did not change. No save needed.');
+    }
+  }, [
+    editedPrompt,
+    originalPrompt,
+    selectedImageIndex,
+    displayedImages,
+    page,
+    itemsPerPage,
+    updateSettingsInStore,
+    refreshDisplayedImages
+  ]);
+
+  const handleImageDoubleClick = (imageUrl: string, imageObj: ImageObject, indexInDisplayed: number) => {
+    setSelectedImage({
+      url: imageUrl,
+      prompt: imageObj.prompt,
+      isVideo: isVideoFile(imageObj.filename)
+    });
+    setSelectedImageIndex(indexInDisplayed);
   };
 
   const handleCloseModal = () => {
-    console.log('[Gallery] handleCloseModal => closing image modal');
+    // Save prompt changes before closing
+    console.log('[Gallery handleCloseModal] Modal closing, calling savePrompt.');
+    savePrompt();
     setSelectedImage(null);
+    setSelectedImageIndex(null);
   };
 
-  const handleKeyDown = (e: KeyboardEvent) => {
+  const handleKeyDown = (e: React.KeyboardEvent) => {
     if (!selectedImage) return;
-    e.stopPropagation();
+
+    // Check if the event target is the prompt input
+    const isPromptInputFocused = promptInputRef.current === document.activeElement;
+    const isMac = navigator.platform.toUpperCase().indexOf('MAC') >= 0;
+    const isCtrlCmd = isMac ? e.metaKey : e.ctrlKey;
+
+    // Handle Escape key regardless of focus
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      handleCloseModal();
+      return;
+    }
+
+    // --- Shortcuts that work regardless of input focus ---
+
+    // Star/Unstar (Ctrl/Cmd + S)
+    if (isCtrlCmd && e.key.toLowerCase() === 's') {
+      e.preventDefault();
+      e.stopPropagation();
+      const imageObj = displayedImages.find((img) => {
+        const baseFilename = img.filename.includes('/') ? img.filename.split('/').pop() : img.filename;
+        return imageUrls[baseFilename || ''] === selectedImage.url;
+      });
+      if (imageObj) {
+        handleStarToggle(imageObj.filename);
+      }
+      return; // Handled
+    }
+
+    // Download (Ctrl/Cmd + D)
+    if (isCtrlCmd && e.key.toLowerCase() === 'd') {
+      e.preventDefault();
+      e.stopPropagation();
+      const imageObj = displayedImages.find((img) => {
+         const baseFilename = img.filename.includes('/') ? img.filename.split('/').pop() : img.filename;
+         return imageUrls[baseFilename || ''] === selectedImage.url;
+      });
+      if (imageObj && selectedImage.url) {
+         handleDownload(selectedImage.url, imageObj.filename);
+      }
+      return; // Handled
+    }
+
+    // Delete (Delete key)
+    if (e.key === 'Delete' && !isPromptInputFocused) { // Avoid deleting text in input
+        e.preventDefault();
+        e.stopPropagation();
+        const imageObjToDelete = displayedImages.find((img) => {
+            const baseFilename = img.filename.includes('/') ? img.filename.split('/').pop() : img.filename;
+            return imageUrls[baseFilename || ''] === selectedImage.url;
+        });
+        if (imageObjToDelete) {
+            const indexInCurrentPage = currentPageImages.findIndex(img => img.filename === imageObjToDelete.filename);
+            if (indexInCurrentPage !== -1) {
+                handleDelete(indexInCurrentPage);
+                handleCloseModal();
+            }
+        }
+        return; // Handled
+    }
+
+    // --- Shortcuts dependent on input focus ---
+
+    if (isPromptInputFocused) {
+      // Discard Changes (Ctrl/Cmd + Z) - Only when input focused & changes exist
+      if (isCtrlCmd && e.key.toLowerCase() === 'z' && editedPrompt !== originalPrompt) {
+        e.preventDefault();
+        e.stopPropagation();
+        setEditedPrompt(originalPrompt);
+      }
+      // Let other keys like Tab, Shift+Tab, regular text input work normally
+
+    } else {
+      // Handle Tab/Shift+Tab for navigation ONLY if the prompt input is NOT focused
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        e.stopPropagation();
+        const direction = e.shiftKey ? 'prev' : 'next';
+        const currentIndex = selectedImageIndex;
+        if (direction === 'prev' && currentIndex !== null && currentIndex > 0) {
+          savePrompt();
+          handleNavigateImage('prev');
+        } else if (direction === 'next' && currentIndex !== null && currentIndex < displayedImages.length - 1) {
+          savePrompt();
+          handleNavigateImage('next');
+        }
+      }
+
+      // Copy Prompt (Ctrl/Cmd + C) - Only when input NOT focused
+      if (isCtrlCmd && e.key.toLowerCase() === 'c') {
+        e.preventDefault();
+        e.stopPropagation();
+        navigator.clipboard.writeText(selectedImage.prompt || '').then(() => {
+            setCopySuccess(true);
+            setTimeout(() => setCopySuccess(false), 1500);
+        }).catch(err => {
+            console.error('[Gallery] => copy to clipboard failed:', err);
+        });
+      }
+    }
+  };
+
+  const handleNavigateImage = (direction: 'prev' | 'next') => {
+    if (!selectedImage) return;
+
     const currentIndex = displayedImages.findIndex((img: ImageObject) => {
       const baseFilename = img.filename.includes('/')
         ? img.filename.split('/').pop()
@@ -338,197 +655,192 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
       return imageUrls[baseFilename || ''] === selectedImage.url;
     });
 
-    if (e.key === 'ArrowLeft') {
-      e.preventDefault();
-      if (currentIndex > 0) {
-        const prevImage = displayedImages[currentIndex - 1];
-        if (prevImage && prevImage.filename) {
-          const baseFilename = prevImage.filename.split('/').pop();
-          setSelectedImage({ url: imageUrls[baseFilename || ''], prompt: prevImage.prompt });
-        }
-      }
-    } else if (e.key === 'ArrowRight') {
-      e.preventDefault();
-      if (currentIndex < displayedImages.length - 1) {
-        const nextImage = displayedImages[currentIndex + 1];
-        if (nextImage && nextImage.filename) {
-          const baseFilename = nextImage.filename.split('/').pop();
-          setSelectedImage({ url: imageUrls[baseFilename || ''], prompt: nextImage.prompt });
-        }
-      }
-    } else if (e.key === 'Escape') {
-      handleCloseModal();
-    }
-  };
-
-  // Attach keyDown globally only if the modal is open
-  useEffect(() => {
-    window.addEventListener('keydown', handleKeyDown);
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown);
-    };
-  }, [selectedImage, displayedImages, imageUrls]);
-
-  const handleNavigateImage = (direction: 'prev' | 'next') => {
-    if (!selectedImage) return;
-    const currentIndex = displayedImages.findIndex((img: ImageObject) => {
-      const baseFilename = img.filename.includes('/') ? img.filename.split('/').pop() : img.filename;
-      return imageUrls[baseFilename || ''] === selectedImage.url;
-    });
+    // Save changes before navigating
+    savePrompt();
 
     let newIndex = direction === 'prev' ? currentIndex - 1 : currentIndex + 1;
     if (newIndex >= 0 && newIndex < displayedImages.length) {
       const imageObj = displayedImages[newIndex];
       if (imageObj && imageObj.filename) {
         const baseFilename = imageObj.filename.split('/').pop();
-        setSelectedImage({ url: imageUrls[baseFilename || ''], prompt: imageObj.prompt });
+        setSelectedImage({
+          url: imageUrls[baseFilename || ''],
+          prompt: imageObj.prompt,
+          isVideo: isVideoFile(imageObj.filename)
+        });
+        setSelectedImageIndex(newIndex);
+        const newPage = Math.floor(newIndex / itemsPerPage) + 1;
+        if (newPage !== page) {
+          setPage(newPage);
+          updateSettingsInStore({ page: newPage });
+        }
       }
     }
   };
 
   const handleSizeChange = (event: any, newSize: ImageSize) => {
     if (newSize !== null) {
-      console.log('[Gallery] handleSizeChange => newSize:', newSize);
       setImageSize(newSize);
-      // Persist it back to the store
-      const newValue = {
-        params: {
-          ...((galleryData && galleryData.params) || {}),
-          component: 'ui_gallery',
-          files: originalOrder.current,
-          imageSize: newSize,
-        }
-      };
-      updateStore?.(fieldKey, newValue);
+      updateSettingsInStore({ imageSize: newSize });
     }
   };
 
+  /**
+   * MAIN DROP HANDLER
+   * - If the drop has 'drag-filename', it's from another Gallery; treat like an OS drop
+   * - If the drop has OS files, upload them
+   */
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
+    dragCounter.current = 0;
     setIsDraggingOver(false);
-    console.log('[Gallery] handleDrop => user dropped files');
 
-    const items = Array.from(e.dataTransfer.items);
-    const files = items
-      .filter((item: any) => item.kind === 'file' && item.type.startsWith('image/'))
+    const fromFilename = e.dataTransfer.getData('drag-filename');
+    if (fromFilename) {
+      // Another gallery is dragging a file into this one:
+      const newFileObj = {
+        filename: fromFilename,
+        starred: false,
+        prompt: e.dataTransfer.getData('drag-prompt') || ''
+      };
+      originalOrder.current.push(newFileObj);
+      await loadImage(fromFilename);
+
+      // Always sort oldest & jump to last page
+      setSortOrder('oldest');
+      const sorted = refreshDisplayedImages(originalOrder.current);
+      const totalPages = Math.ceil(sorted.length / itemsPerPage);
+      setPage(totalPages);
+      updateSettingsInStore({ 
+        files: originalOrder.current,
+        sortOrder: 'oldest',
+        page: totalPages
+      });
+      return;
+    }
+
+    let fileItems = Array.from(e.dataTransfer.items || []);
+    if (!fileItems.length && e.dataTransfer.files) {
+      fileItems = Array.from(e.dataTransfer.files).map((f: File) => ({
+        kind: 'file',
+        type: f.type,
+        getAsFile: () => f
+      })) as any[];
+    }
+
+    const files = fileItems
+      .filter((item: any) => {
+        return item.kind === 'file' && 
+          (item.type.startsWith?.('image/') || item.type.startsWith?.('video/'));
+      })
       .map((item: any) => item.getAsFile());
 
-    console.log('[Gallery] => handleDrop => Found image files:', files.map((f) => f.name));
+    if (!files.length) return;
 
-    if (files.length > 0) {
-      try {
-        const newImages = await Promise.all(
-          files.map(async (file: File) => {
-            console.log('[Gallery] => handleDrop => uploading file:', file.name);
-            const formData = new FormData();
-            const timestamp = Date.now();
-            const fileName = `${timestamp}_${file.name}`;
-            formData.append('file', file, fileName);
+    try {
+      const newImages: ImageObject[] = [];
+      for (let file of files) {
+        if (!file) continue;
 
-            const response = await fetch(`http://${config.serverAddress}/data/files`, {
-              method: 'POST',
-              body: formData,
-            });
-            if (!response.ok) {
-              throw new Error(`Failed to upload file: ${response.statusText}`);
+        const formData = new FormData();
+        const timestamp = Date.now();
+        const fileName = `${timestamp}_${file.name}`;
+        formData.append('file', file, fileName);
+
+        let savedFileName = '';
+        try {
+          const response = await fetch(`http://${config.serverAddress}/data/files`, {
+            method: 'POST',
+            body: formData
+          });
+          if (!response.ok) {
+            const bodyText = await response.text();
+            throw new Error(`Failed to upload file: ${response.statusText} => ${bodyText}`);
+          }
+          savedFileName = await response.text();
+        } catch (err) {
+          console.error('[Gallery] => handleDrop => file upload error:', err);
+          continue;
+        }
+
+        if (!savedFileName) {
+          continue;
+        }
+        const newObj: ImageObject = { filename: savedFileName, starred: false, prompt: '' };
+        newImages.push(newObj);
+      }
+
+      if (newImages.length) {
+        originalOrder.current.push(...newImages);
+
+        await Promise.all(
+          newImages.map(async (image) => {
+            const baseFileName = image.filename.split('/').pop() || image.filename;
+            if (!imageUrls[baseFileName]) {
+              await loadImage(image.filename);
             }
-
-            const savedFileName = await response.text();
-            console.log('[Gallery] => handleDrop => server saved file as:', savedFileName);
-            return { filename: savedFileName, starred: false, prompt: '' };
           })
         );
 
-        console.log('[Gallery] => handleDrop => newImages:', newImages);
-        const updatedImages = [...originalOrder.current, ...newImages];
-        originalOrder.current = updatedImages;
-
-        newImages.forEach((image) => {
-          const baseFileName = image.filename.split('/').pop() || image.filename;
-          if (!imageUrls[baseFileName]) {
-            loadImage(image.filename);
-          }
+        // Force sort to oldest & jump to last page so new items appear at the bottom
+        setSortOrder('oldest');
+        const sorted = refreshDisplayedImages(originalOrder.current);
+        const totalPages = Math.ceil(sorted.length / itemsPerPage);
+        setPage(totalPages);
+        updateSettingsInStore({
+          files: originalOrder.current,
+          sortOrder: 'oldest',
+          page: totalPages
         });
-
-        let filteredImages = showStarredOnly
-          ? updatedImages.filter((img) => img.starred)
-          : updatedImages;
-        filteredImages = sortOrder === 'newest' ? [...filteredImages].reverse() : [...filteredImages];
-
-        updateStore?.(fieldKey, { params: { component: 'ui_gallery', files: updatedImages } });
-        setDisplayedImages(filteredImages);
-      } catch (error) {
-        console.error('[Gallery] => handleDrop => Error handling dropped files:', error);
       }
-    } else {
-      // Handle drop from another gallery (non-file drop)
-      const draggedUrl = e.dataTransfer.getData('text/plain');
-      const draggedFilename = e.dataTransfer.getData('drag-filename');
-      if (draggedUrl && draggedFilename) {
-        console.log('[Gallery] handleDrop => processing dragged image from another gallery');
-        const newImage = { filename: draggedFilename, starred: false, prompt: '' };
-        const updatedImages = [...originalOrder.current, newImage];
-        originalOrder.current = updatedImages;
-        const baseFileName = draggedFilename.includes('/') ? draggedFilename.split('/').pop() : draggedFilename;
-        if (baseFileName && !imageUrls[baseFileName]) {
-          loadImage(draggedFilename);
-        }
-        let filteredImages = showStarredOnly
-          ? updatedImages.filter((img) => img.starred)
-          : updatedImages;
-        filteredImages = sortOrder === 'newest' ? [...filteredImages].reverse() : [...filteredImages];
-        setDisplayedImages(filteredImages);
-        updateStore?.(fieldKey, { params: { component: 'ui_gallery', files: updatedImages } });
-      } else {
-        console.log('[Gallery] handleDrop => no valid dropped image data found');
-      }
+    } catch (error) {
+      console.error('[Gallery] => handleDrop => Error handling dropped files:', error);
     }
+  };
+
+  const handleDragEnter = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounter.current++;
+    setIsDraggingOver(true);
   };
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    setIsDraggingOver(true);
   };
 
   const handleDragLeave = (e: React.DragEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    setIsDraggingOver(false);
+    dragCounter.current--;
+    if (dragCounter.current <= 0) {
+      dragCounter.current = 0;
+      setIsDraggingOver(false);
+    }
   };
 
-  const handleReorder = (e: React.DragEvent<HTMLElement>, targetImage: ImageObject): void => {
-    e.preventDefault();
-    const fromFilename: string = e.dataTransfer.getData('drag-filename');
-    if (!fromFilename) return;
-    if (fromFilename === targetImage.filename) return;
-
-    const order = [...originalOrder.current];
-    const fromIndex = order.findIndex((img) => img.filename === fromFilename);
-    const toIndex = order.findIndex((img) => img.filename === targetImage.filename);
-    if (fromIndex === -1 || toIndex === -1) return;
-
-    const [movedItem] = order.splice(fromIndex, 1);
-    order.splice(toIndex, 0, movedItem);
-    originalOrder.current = order;
-
-    // If user is reordering, we set sortOrder to 'custom'
-    setSortOrder('custom');
-
-    let newDisplayedImages = showStarredOnly
-      ? order.filter((img) => img.starred)
-      : [...order];
-    setDisplayedImages(newDisplayedImages);
-
-    const newValue = { params: { component: 'ui_gallery', files: order } };
-    updateStore?.(fieldKey, newValue);
-  };
+  useEffect(() => {
+    const cleanup = () => {
+      setIsDraggingOver(false);
+      dragCounter.current = 0;
+    };
+    window.addEventListener('dragend', cleanup);
+    return () => {
+      window.removeEventListener('dragend', cleanup);
+    };
+  }, []);
 
   const handleStarToggle = async (filename: string) => {
-    console.log('[Gallery] handleStarToggle => toggling star for', filename);
     const imageIndex = originalOrder.current.findIndex((img) => img.filename === filename);
     if (imageIndex === -1) return;
+
+    // Capture the current index of the selected image from displayedImages
+    const currentIndex = displayedImages.findIndex((img: ImageObject) => {
+      const baseFilename = img.filename.includes('/') ? img.filename.split('/').pop() : img.filename;
+      return imageUrls[baseFilename || ''] === selectedImage?.url;
+    });
 
     const updatedImage = {
       ...originalOrder.current[imageIndex],
@@ -541,41 +853,62 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
     );
     setStarredImages(newStarredImages);
 
-    let newDisplayedImages = showStarredOnly
-      ? originalOrder.current.filter((img) => img.starred)
-      : [...originalOrder.current];
+    // Refresh displayed images
+    const newDisplayed = refreshDisplayedImages(originalOrder.current);
 
-    newDisplayedImages = (sortOrder === 'newest')
-      ? [...newDisplayedImages].reverse()
-      : newDisplayedImages;
-    setDisplayedImages(newDisplayedImages);
+    updateSettingsInStore({
+      files: originalOrder.current
+    });
 
-    // Persist
-    const newValue = {
-      params: { component: 'ui_gallery', files: originalOrder.current }
-    };
-    updateStore?.(fieldKey, newValue);
+    // If in 'Starred Only' view and the toggled image was the one currently selected (and now unstarred), update selection
+    const toggledBaseFilename = filename.includes('/') ? filename.split('/').pop() : filename;
+    const toggledImageUrl = imageUrls[toggledBaseFilename || ''];
+    if (showStarredOnly && !updatedImage.starred && selectedImage && selectedImage.url === toggledImageUrl) {
+      let newIndex = currentIndex;
+      if (newIndex < 0 || newIndex >= newDisplayed.length) {
+        newIndex = 0;
+      } else {
+        const candidate = newDisplayed[newIndex];
+        const candidateBase = candidate.filename.includes('/') ? candidate.filename.split('/').pop() : candidate.filename;
+        if (imageUrls[candidateBase || ''] === toggledImageUrl) {
+          if (newIndex + 1 < newDisplayed.length) {
+            newIndex++;
+          } else if (newIndex - 1 >= 0) {
+            newIndex--;
+          }
+        }
+      }
+      if (newDisplayed.length > 0 && newIndex >= 0 && newIndex < newDisplayed.length) {
+        const newImage = newDisplayed[newIndex];
+        const newBase = newImage.filename.includes('/') ? newImage.filename.split('/').pop() : newImage.filename;
+        setSelectedImage({
+          url: imageUrls[newBase || ''],
+          prompt: newImage.prompt,
+          isVideo: isVideoFile(newImage.filename)
+        });
+        setSelectedImageIndex(newIndex);
+      } else {
+        setSelectedImage(null);
+        setSelectedImageIndex(null);
+      }
+    }
   };
 
   const handleDeleteNonStarred = async () => {
-    console.log('[Gallery] handleDeleteNonStarred => user confirmed delete all non-starred');
     setIsDeletingNonStarred(true);
     try {
       const nonStarredImages = originalOrder.current.filter((img) => !img.starred);
-      console.log('[Gallery] => handleDeleteNonStarred => nonStarredImages:', nonStarredImages);
 
       for (const imageObj of nonStarredImages) {
         const filename = imageObj.filename;
         const baseFilename = filename.includes('/') ? filename.split('/').pop() : filename;
 
-        // Remove from imageUrls
         setImageUrls((prev) => {
           const newUrls = { ...prev };
-          delete newUrls[baseFilename || ''];
+          if (baseFilename) delete newUrls[baseFilename];
           return newUrls;
         });
 
-        // Delete from server
         try {
           await dataService.deleteNodeFile(galleryData.nodeId || '', baseFilename || '');
         } catch (err) {
@@ -583,31 +916,41 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
         }
       }
 
-      // Now keep only the starred images
       originalOrder.current = originalOrder.current.filter((img) => img.starred);
+      refreshDisplayedImages(originalOrder.current);
 
-      const newDisplayedImages = (sortOrder === 'newest')
-        ? [...originalOrder.current].reverse()
-        : [...originalOrder.current];
-
-      setDisplayedImages(newDisplayedImages);
-
-      // Save updated list
-      const newValue = { params: { component: 'ui_gallery', files: originalOrder.current } };
-      updateStore?.(fieldKey, newValue);
+      updateSettingsInStore({ files: originalOrder.current });
     } finally {
       setIsDeletingNonStarred(false);
       setDeleteNonStarredDialogOpen(false);
     }
   };
 
-  // If hidden, we can either skip rendering or rely on a 'mellon-hidden' class
+  const handleDownload = async (url: string, filename: string) => {
+    try {
+      const response = await fetch(url);
+      const blob = await response.blob();
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(downloadUrl);
+    } catch (error) {
+      console.error('[Gallery] handleDownload => Error downloading file:', error);
+    }
+  };
+
   return (
     <Box
       key={fieldKey}
       data-key={fieldKey}
       sx={{ ...style }}
-      className={`nodrag ${disabled ? 'mellon-disabled' : ''} ${hidden ? 'mellon-hidden' : ''}`}
+      className={`nodrag ${disabled ? 'mellon-disabled' : ''} ${
+        hidden ? 'mellon-hidden' : ''
+      }`}
     >
       <Box
         sx={{
@@ -616,13 +959,13 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
           minHeight: '200px',
           border: isDraggingOver ? '2px dashed #FFA500' : '2px dashed transparent',
           borderRadius: 2,
-          transition: 'border-color 0.2s ease-in-out',
+          transition: 'border-color 0.2s ease-in-out'
         }}
-        onDrop={handleDrop}
+        onDragEnter={handleDragEnter}
         onDragOver={handleDragOver}
         onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
       >
-        {/* The image preview modal */}
         <Modal
           open={selectedImage !== null}
           onClose={handleCloseModal}
@@ -634,6 +977,8 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
           }}
         >
           <Box
+            onKeyDown={handleKeyDown}
+            tabIndex={0}
             sx={{
               position: 'relative',
               maxWidth: '90vw',
@@ -644,7 +989,15 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
               alignItems: 'center'
             }}
           >
-            <Box sx={{ position: 'relative' }}>
+            <Box 
+              sx={{ 
+                position: 'relative',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                width: 'fit-content'
+              }}
+            >
               <IconButton
                 onClick={handleCloseModal}
                 sx={{
@@ -663,176 +1016,305 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
               >
                 <CloseIcon />
               </IconButton>
-              <Box sx={{ position: 'relative' }}>
-                <img
-                  src={selectedImage?.url}
-                  alt="Selected image"
-                  style={{
-                    maxWidth: '100%',
-                    maxHeight: '90vh',
-                    objectFit: 'contain',
-                    borderRadius: '8px 8px 0 0',
-                    boxShadow: '0 8px 32px rgba(0,0,0,0.5)'
-                  }}
-                />
-                {/* Star / Delete buttons on top of the large preview */}
+              <Box sx={{ position: 'relative', width: 'fit-content' }}>
+                {selectedImage?.isVideo ? (
+                    <video
+                      ref={mediaRef as React.RefObject<HTMLVideoElement>}
+                      src={selectedImage.url}
+                      controls
+                      autoPlay
+                      loop
+                      style={{
+                        maxWidth: '100%',
+                        maxHeight: '90vh',
+                        objectFit: 'contain',
+                        borderRadius: '8px 8px 0 0',
+                        boxShadow: '0 8px 32px rgba(0,0,0,0.5)'
+                      }}
+                    />
+                ) : (
+                  <img
+                    ref={mediaRef as React.RefObject<HTMLImageElement>}
+                    src={selectedImage?.url}
+                    alt="Selected"
+                    onLoad={updateMediaWidth}
+                    style={{
+                      maxWidth: '100%',
+                      maxHeight: '90vh',
+                      objectFit: 'contain',
+                      borderRadius: '8px 8px 0 0',
+                      boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
+                      display: 'block'
+                    }}
+                  />
+                )}
+
                 <Box
                   sx={{
                     position: 'absolute',
-                    bottom: 8,
+                    top: 8,
                     left: 8,
                     display: 'flex',
                     gap: 1,
                     zIndex: 1
                   }}
                 >
-                  <IconButton
-                    onClick={() => {
-                      const imageObj = displayedImages.find((img) => {
+                  <Tooltip title={displayedImages.find(img => {
+                        const baseFilename = img.filename.includes('/') ? img.filename.split('/').pop() : img.filename;
+                        return imageUrls[baseFilename || ''] === selectedImage?.url;
+                      })?.starred ? "Unstar (Ctrl+S)" : "Star (Ctrl+S)"}>
+                    <IconButton
+                      onClick={() => {
+                        const imageObj = displayedImages.find((img) => {
+                          const baseFilename = img.filename.includes('/')
+                            ? img.filename.split('/').pop()
+                            : img.filename;
+                          return imageUrls[baseFilename || ''] === selectedImage?.url;
+                        });
+                        if (imageObj) {
+                          handleStarToggle(imageObj.filename);
+                        }
+                      }}
+                      sx={{
+                        backgroundColor: 'rgba(0, 0, 0, 0.5)',
+                        color: 'white',
+                        width: 32,
+                        height: 32,
+                        padding: '4px'
+                      }}
+                    >
+                      {displayedImages.find((img) => {
                         const baseFilename = img.filename.includes('/')
                           ? img.filename.split('/').pop()
                           : img.filename;
                         return imageUrls[baseFilename || ''] === selectedImage?.url;
-                      });
-                      if (imageObj) {
-                        handleStarToggle(imageObj.filename);
-                      }
-                    }}
-                    sx={{
-                      backgroundColor: 'rgba(0, 0, 0, 0.5)',
-                      color: 'white',
-                      width: 32,
-                      height: 32,
-                      padding: '4px'
-                    }}
-                  >
-                    {displayedImages.find((img) => {
-                      const baseFilename = img.filename.includes('/')
-                        ? img.filename.split('/').pop()
-                        : img.filename;
-                      return imageUrls[baseFilename || ''] === selectedImage?.url;
-                    })?.starred
-                      ? <StarIcon />
-                      : <StarBorderIcon />
-                    }
-                  </IconButton>
-                  <IconButton
-                    onClick={() => {
-                      const imageIndex = displayedImages.findIndex((img) => {
-                        const baseFilename = img.filename.includes('/')
-                          ? img.filename.split('/').pop()
-                          : img.filename;
-                        return imageUrls[baseFilename || ''] === selectedImage?.url;
-                      });
-                      if (imageIndex !== -1) {
-                        handleDelete(imageIndex);
-                        handleCloseModal();
-                      }
-                    }}
-                    sx={{
-                      backgroundColor: 'rgba(0, 0, 0, 0.5)',
-                      color: 'white',
-                      width: 32,
-                      height: 32,
-                      padding: '4px'
-                    }}
-                  >
-                    <DeleteIcon />
-                  </IconButton>
+                      })?.starred ? (
+                        <StarIcon sx={{ color: 'primary.main' }} />
+                      ) : (
+                        <StarBorderIcon />
+                      )}
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip title="Download (Ctrl+D)">
+                    <IconButton
+                      onClick={() => {
+                        const imageObj = displayedImages.find((img) => {
+                          const baseFilename = img.filename.includes('/')
+                            ? img.filename.split('/').pop()
+                            : img.filename;
+                          return imageUrls[baseFilename || ''] === selectedImage?.url;
+                        });
+                        if (imageObj && selectedImage?.url) {
+                          handleDownload(selectedImage.url, imageObj.filename);
+                        }
+                      }}
+                      sx={{
+                        backgroundColor: 'rgba(0, 0, 0, 0.5)',
+                        color: 'white',
+                        width: 32,
+                        height: 32,
+                        padding: '4px'
+                      }}
+                    >
+                      <DownloadIcon />
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip title="Delete (Del)">
+                    <IconButton
+                      onClick={() => {
+                        const imageObjToDelete = displayedImages.find((img) => {
+                          const baseFilename = img.filename.includes('/') ? img.filename.split('/').pop() : img.filename;
+                          return imageUrls[baseFilename || ''] === selectedImage?.url;
+                        });
+                        if (imageObjToDelete) {
+                           // Find the index in the *original* order to delete properly
+                           const indexInOriginal = originalOrder.current.findIndex(img => img.filename === imageObjToDelete.filename);
+                           if (indexInOriginal !== -1) {
+                             // We need the index relative to the *current page* for the existing handleDelete
+                             // OR modify handleDelete to accept filename directly.
+                             // Let's find index in the current page for now:
+                             const indexInCurrentPage = currentPageImages.findIndex(img => img.filename === imageObjToDelete.filename);
+                             if (indexInCurrentPage !== -1) {
+                               handleDelete(indexInCurrentPage); // Use the index within the current page
+                               handleCloseModal(); // Close modal after delete
+                             }
+                           }
+                        }
+                      }}
+                      sx={{
+                        backgroundColor: 'rgba(0, 0, 0, 0.5)',
+                        color: 'white',
+                        width: 32,
+                        height: 32,
+                        padding: '4px'
+                      }}
+                    >
+                      <DeleteIcon />
+                    </IconButton>
+                  </Tooltip>
                 </Box>
               </Box>
-              {selectedImage?.prompt && (
-                <Box
-                  sx={{
-                    position: 'relative',
-                    width: '100%',
-                    backgroundColor: 'black',
-                    color: 'white',
-                    padding: '12px',
-                    borderRadius: '0 0 8px 8px',
-                    fontFamily: 'monospace',
-                    fontSize: '14px',
-                    whiteSpace: 'pre-wrap',
-                    wordBreak: 'break-word',
-                    display: 'flex',
-                    alignItems: 'flex-start',
-                    gap: 2
-                  }}
-                >
-                  {/* Copy-to-clipboard button */}
-                  <IconButton
-                    onClick={async () => {
-                      try {
-                        await navigator.clipboard.writeText(selectedImage.prompt);
-                        setCopySuccess(true);
-                        setTimeout(() => setCopySuccess(false), 1500);
-                      } catch (err) {
-                        console.error('[Gallery] => copy to clipboard failed:', err);
-                      }
-                    }}
-                    sx={{
-                      color: copySuccess ? '#4caf50' : 'white',
-                      padding: '4px',
-                      '&:hover': {
-                        backgroundColor: 'rgba(255, 255, 255, 0.1)'
-                      }
-                    }}
-                    size="small"
-                  >
-                    {copySuccess ? <CheckIcon sx={{ fontSize: 16 }} /> : <ContentCopyIcon sx={{ fontSize: 16 }} />}
-                  </IconButton>
-                  <Box sx={{ flex: 1 }}>{selectedImage.prompt}</Box>
+
+              {/* Editable Prompt Section */}
+              <Box
+                sx={{
+                  backgroundColor: 'black',
+                  color: 'white',
+                  padding: '12px',
+                  borderRadius: '0 0 8px 8px',
+                  fontFamily: 'monospace',
+                  fontSize: '14px',
+                  whiteSpace: 'pre-wrap',
+                  wordBreak: 'break-word',
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 2,
+                  width: mediaWidth ? `${mediaWidth}px` : 'auto',
+                  boxSizing: 'border-box'
+                }}
+              >
+                {/* Copy/Discard controls */}
+                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                  <Tooltip title="Copy Prompt (Ctrl+C)">
+                    <IconButton
+                      onClick={async () => {
+                        try {
+                          await navigator.clipboard.writeText(editedPrompt);
+                          setCopySuccess(true);
+                          setTimeout(() => setCopySuccess(false), 1500);
+                        } catch (err) {
+                          console.error('[Gallery] => copy to clipboard failed:', err);
+                        }
+                      }}
+                      sx={{
+                        color: copySuccess ? '#4caf50' : 'white',
+                        padding: '4px',
+                        '&:hover': {
+                          backgroundColor: 'rgba(255, 255, 255, 0.1)'
+                        }
+                      }}
+                      size="small"
+                      disabled={copySuccess}
+                    >
+                      {copySuccess ? (
+                        <CheckIcon sx={{ fontSize: 16 }} />
+                      ) : (
+                        <ContentCopyIcon sx={{ fontSize: 16 }} />
+                      )}
+                    </IconButton>
+                  </Tooltip>
+                  {editedPrompt !== originalPrompt && (
+                    <Tooltip title="Discard Changes (Ctrl+Z)">
+                      <IconButton
+                        onClick={() => setEditedPrompt(originalPrompt)}
+                        sx={{
+                          color: 'white',
+                          padding: '4px',
+                          '&:hover': {
+                            backgroundColor: 'rgba(255, 255, 255, 0.1)'
+                          }
+                        }}
+                        size="small"
+                      >
+                        <CloseIcon sx={{ fontSize: 16 }} />
+                      </IconButton>
+                    </Tooltip>
+                  )}
                 </Box>
-              )}
+
+                {/* The text field for editing */}
+                <TextField
+                  inputRef={promptInputRef}
+                  variant="outlined"
+                  size="small"
+                  multiline
+                  fullWidth
+                  autoFocus
+                  minRows={1}
+                  maxRows={5}
+                  value={editedPrompt}
+                  onChange={(e) => setEditedPrompt(e.target.value)}
+                  sx={{
+                    '& .MuiOutlinedInput-root': {
+                      backgroundColor: 'rgba(255, 255, 255, 0.1)',
+                      color: 'white',
+                      fontFamily: 'monospace',
+                      fontSize: '14px',
+                      lineHeight: 1.4
+                    },
+                    '& .MuiInputBase-input': {
+                      padding: '8px'
+                    },
+                    '& .MuiOutlinedInput-notchedOutline': {
+                      borderColor: 'rgba(255, 255, 255, 0.2)'
+                    },
+                    '&:hover .MuiOutlinedInput-notchedOutline': {
+                      borderColor: 'rgba(255, 255, 255, 0.4)'
+                    },
+                    '&.Mui-focused .MuiOutlinedInput-notchedOutline': {
+                      borderColor: '#ffffff'
+                    },
+                    flex: 1
+                  }}
+                />
+              </Box>
             </Box>
-            <IconButton
-              onClick={() => handleNavigateImage('prev')}
-              sx={{
+
+            <Tooltip title="Previous (Shift+Tab)">
+              <span style={{
                 position: 'absolute',
                 left: -56,
                 top: '50%',
                 transform: 'translateY(-50%)',
-                color: 'white',
-                bgcolor: 'rgba(0, 0, 0, 0.5)',
-                transition: 'all 0.2s ease-in-out',
-                '&:hover': {
-                  bgcolor: 'rgba(0, 0, 0, 0.7)',
-                  transform: 'translateY(-50%) scale(1.1)'
-                },
-                '&.Mui-disabled': {
-                  display: 'none'
-                }
-              }}
-              disabled={!displayedImages.some((_, idx) => idx < displayedImages.length && idx === 0)}
-            >
-              <ChevronLeftIcon />
-            </IconButton>
-            <IconButton
-              onClick={() => handleNavigateImage('next')}
-              sx={{
-                position: 'absolute',
-                right: -56,
-                top: '50%',
-                transform: 'translateY(-50%)',
-                color: 'white',
-                bgcolor: 'rgba(0, 0, 0, 0.5)',
-                transition: 'all 0.2s ease-in-out',
-                '&:hover': {
-                  bgcolor: 'rgba(0, 0, 0, 0.7)',
-                  transform: 'translateY(-50%) scale(1.1)'
-                },
-                '&.Mui-disabled': {
-                  display: 'none'
-                }
-              }}
-              disabled={!displayedImages.some((_, idx) => idx === displayedImages.length - 1)}
-            >
-              <ChevronRightIcon />
-            </IconButton>
+                display: (selectedImageIndex === null || selectedImageIndex <= 0) ? 'none' : 'inline-block' 
+              }}> 
+                <IconButton
+                  onClick={() => handleNavigateImage('prev')}
+                  sx={{
+                    color: 'white',
+                    bgcolor: 'rgba(0, 0, 0, 0.5)',
+                    transition: 'all 0.2s ease-in-out',
+                    '&:hover': {
+                      bgcolor: 'rgba(0, 0, 0, 0.7)',
+                      transform: 'scale(1.1)'
+                    }
+                  }}
+                  disabled={selectedImageIndex === null || selectedImageIndex <= 0}
+                  aria-label="Previous Image"
+                >
+                  <ChevronLeftIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+            <Tooltip title="Next (Tab)">
+              <span style={{
+                  position: 'absolute',
+                  right: -56,
+                  top: '50%',
+                  transform: 'translateY(-50%)',
+                  display: (selectedImageIndex === null || selectedImageIndex >= displayedImages.length - 1) ? 'none' : 'inline-block'
+                }}> 
+                <IconButton
+                  onClick={() => handleNavigateImage('next')}
+                  sx={{
+                    color: 'white',
+                    bgcolor: 'rgba(0, 0, 0, 0.5)',
+                    transition: 'all 0.2s ease-in-out',
+                    '&:hover': {
+                      bgcolor: 'rgba(0, 0, 0, 0.7)',
+                      transform: 'scale(1.1)'
+                    }
+                  }}
+                  disabled={selectedImageIndex === null || selectedImageIndex >= displayedImages.length - 1}
+                  aria-label="Next Image"
+                >
+                  <ChevronRightIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
           </Box>
         </Modal>
 
-        {/* Top bar: Items/page, columns, sorting, starred toggle */}
         <Box
           sx={{
             mb: 2,
@@ -852,13 +1334,18 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
                   value={itemsPerPage}
                   label="Items/page"
                   onChange={(e) => {
-                    setItemsPerPage(e.target.value as number);
-                    setPage(1);
+                    const newValue = parseInt(e.target.value as string, 10);
+                    setItemsPerPage(newValue);
+                    const newTotalPages = Math.ceil(displayedImages.length / newValue);
+                    setPage(newTotalPages);
+                    updateSettingsInStore({ itemsPerPage: newValue, page: newTotalPages });
                   }}
                   sx={{ color: 'text.primary' }}
                 >
                   {ITEMS_PER_PAGE_OPTIONS.map((option) => (
-                    <MenuItem key={option} value={option}>{option}</MenuItem>
+                    <MenuItem key={option} value={option}>
+                      {option}
+                    </MenuItem>
                   ))}
                 </Select>
               </FormControl>
@@ -868,11 +1355,17 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
                   labelId="columns-label"
                   value={numColumns}
                   label="Columns"
-                  onChange={(e) => setNumColumns(e.target.value as number)}
+                  onChange={(e) => {
+                    const newValue = parseInt(e.target.value as string, 10);
+                    setNumColumns(newValue);
+                    updateSettingsInStore({ numColumns: newValue });
+                  }}
                   sx={{ color: 'text.primary' }}
                 >
                   {COLUMNS_OPTIONS.map((option) => (
-                    <MenuItem key={option} value={option}>{option}</MenuItem>
+                    <MenuItem key={option} value={option}>
+                      {option}
+                    </MenuItem>
                   ))}
                 </Select>
               </FormControl>
@@ -884,16 +1377,37 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
               size="small"
               sx={{
                 '& .MuiPaginationItem-root': {
-                  color: 'text.primary',
-                },
+                  color: 'text.primary'
+                }
               }}
             />
+            <TextField
+              variant="outlined"
+              size="small"
+              placeholder="Search images..."
+              value={searchTerm}
+              onChange={(e) => {
+                const newValue = e.target.value;
+                setSearchTerm(newValue);
+                updateSettingsInStore({ searchTerm: newValue });
+                refreshDisplayedImages(originalOrder.current);
+              }}
+              sx={{ mt: 1 }}
+            />
           </Box>
+
+          {/* Sort Toggling: now the text reflects the *current* mode */}
           <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'flex-end' }}>
             <Button
-              onClick={() => handleSortChange(null, sortOrder === 'newest' ? 'oldest' : 'newest')}
+              onClick={() =>
+                handleSortChange(null, sortOrder === 'newest' ? 'oldest' : 'newest')
+              }
               size="small"
-              startIcon={<SortIcon sx={{ transform: sortOrder === 'newest' ? 'scaleY(-1)' : 'none' }} />}
+              startIcon={
+                <SortIcon
+                  sx={{ transform: sortOrder === 'newest' ? 'none' : 'scaleY(-1)' }}
+                />
+              }
               sx={{
                 color: 'text.primary',
                 '&:hover': {
@@ -906,23 +1420,20 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
             <Button
               onClick={() => {
                 const newShowStarredOnly = !showStarredOnly;
-                console.log('[Gallery] Toggling showStarredOnly =>', newShowStarredOnly);
                 setShowStarredOnly(newShowStarredOnly);
 
-                const filteredImages = newShowStarredOnly
+                const newFiltered = newShowStarredOnly
                   ? originalOrder.current.filter((img) => img.starred)
-                  : originalOrder.current;
+                  : [...originalOrder.current];
+                const newTotalPages = Math.ceil(newFiltered.length / itemsPerPage);
+                const nextPage = page > newTotalPages ? 1 : page;
+                setPage(nextPage);
 
-                const sortedImages = (sortOrder === 'newest')
-                  ? [...filteredImages].reverse()
-                  : [...filteredImages];
-
-                const newTotalPages = Math.ceil(filteredImages.length / itemsPerPage);
-                if (page > newTotalPages) {
-                  setPage(1);
-                }
-
-                setDisplayedImages(sortedImages);
+                refreshDisplayedImages(originalOrder.current);
+                updateSettingsInStore({
+                  showStarredOnly: newShowStarredOnly,
+                  page: nextPage
+                });
               }}
               size="small"
               startIcon={showStarredOnly ? <StarIcon /> : <StarBorderIcon />}
@@ -938,7 +1449,6 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
           </Box>
         </Box>
 
-        {/* The main image grid */}
         <Box sx={{ position: 'relative', mb: 2 }}>
           <ImageList
             cols={numColumns}
@@ -957,135 +1467,304 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
               }
             }}
           >
-            {currentPageImages.map((imageObj, index) => {
-              // Skip invalid objects
-              if (!imageObj || !imageObj.filename) {
-                console.warn('[Gallery] => invalid imageObj encountered:', imageObj);
-                return null;
-              }
+            {currentPageImages
+              .map((imageObj, index) => {
+                if (!imageObj || !imageObj.filename) {
+                  return null;
+                }
 
-              const filename = imageObj.filename;
-              const baseFilename = filename.includes('/') ? filename.split('/').pop() : filename;
-              const isStarred = imageObj.starred;
-              return (
-                <ImageListItem
-                  key={`${filename}_${index}`}
-                  sx={{
-                    position: 'relative',
-                    transition: 'transform 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
-                    '&:hover': {
-                      transform: 'scale(1.05)',
-                      zIndex: 1,
-                      '& img': {
-                        boxShadow: '0 8px 16px rgba(0,0,0,0.2)'
-                      },
-                      '& .image-action-button': {
-                        opacity: 1,
-                        transform: 'scale(1)'
+                const filename = imageObj.filename;
+                const baseFilename = filename.includes('/')
+                  ? filename.split('/').pop()
+                  : filename;
+                const isStarred = imageObj.starred;
+
+                return (
+                  <ImageListItem
+                    key={`${filename}_${index}`}
+                    sx={{
+                      position: 'relative',
+                      transition: 'transform 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
+                      '&:hover': {
+                        transform: 'scale(1.05)',
+                        zIndex: 1,
+                        '& img': {
+                          boxShadow: '0 8px 16px rgba(0,0,0,0.2)'
+                        },
+                        '& .image-action-button': {
+                          opacity: 1,
+                          transform: 'scale(1)'
+                        }
                       }
-                    }
-                  }}
-                  onDragOver={(e) => e.preventDefault()}
-                  onDrop={(e) => {
-                    e.stopPropagation();
-                    handleReorder(e, imageObj);
-                  }}
-                >
-                  {imageUrls[baseFilename || ''] && (
-                    <Box
-                      sx={{
-                        position: 'relative',
-                        width: IMAGE_SIZES[imageSize],
-                        height: IMAGE_SIZES[imageSize]
-                      }}
-                    >
-                      {!loadedImages[baseFilename || ''] && (
-                        <Skeleton
-                          variant="rounded"
-                          width={IMAGE_SIZES[imageSize]}
-                          height={IMAGE_SIZES[imageSize]}
-                          animation="wave"
+                    }}
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={handleDrop}
+                  >
+                    {imageUrls[baseFilename || ''] && (
+                      <Box
+                        sx={{
+                          position: 'relative',
+                          width: IMAGE_SIZES[imageSize],
+                          height: IMAGE_SIZES[imageSize]
+                        }}
+                      >
+                        {!loadedImages[baseFilename || ''] && (
+                          <Skeleton
+                            variant="rounded"
+                            width={IMAGE_SIZES[imageSize]}
+                            height={IMAGE_SIZES[imageSize]}
+                            animation="wave"
+                            sx={{
+                              position: 'absolute',
+                              top: 0,
+                              left: 0,
+                              bgcolor: 'rgba(255, 255, 255, 0.1)',
+                              borderRadius: '4px'
+                            }}
+                          />
+                        )}
+                        <Fade in={loadedImages[baseFilename || '']} timeout={500}>
+                          <div>
+                            {isVideoFile(filename) ? (
+                              <div
+                                onClick={() =>
+                                  handleImageDoubleClick(
+                                    imageUrls[baseFilename || ''],
+                                    imageObj,
+                                    index
+                                  )
+                                }
+                                style={{
+                                  width: IMAGE_SIZES[imageSize],
+                                  height: IMAGE_SIZES[imageSize],
+                                  borderRadius: '4px',
+                                  cursor: 'pointer',
+                                  position: 'relative',
+                                  overflow: 'visible'
+                                }}
+                              >
+                                <video
+                                  src={imageUrls[baseFilename || '']}
+                                  onMouseEnter={(ev) => {
+                                    if (!isDraggingMedia) {
+                                      ev.currentTarget.play();
+                                    }
+                                  }}
+                                  onMouseLeave={(ev) => ev.currentTarget.pause()}
+                                  onDragEnd={() => setIsDraggingMedia(false)}
+                                  onLoadedData={() =>
+                                    handleImageLoad(baseFilename || '')
+                                  }
+                                  onDragStart={(ev) => handleDragStart(ev, index)}
+                                  onError={() => handleDelete(index)}
+                                  draggable
+                                  style={{
+                                    width: '100%',
+                                    height: '100%',
+                                    objectFit: 'cover',
+                                    borderRadius: '4px',
+                                    boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
+                                    transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+                                    opacity: loadedImages[baseFilename || ''] ? 1 : 0
+                                  }}
+                                />
+                              </div>
+                            ) : (
+                              <div
+                                style={{
+                                  width: IMAGE_SIZES[imageSize],
+                                  height: IMAGE_SIZES[imageSize],
+                                  position: 'relative',
+                                  overflow: 'visible'
+                                }}
+                              >
+                                <img
+                                  src={imageUrls[baseFilename || '']}
+                                  alt={`Generated image ${index + 1}`}
+                                  loading="lazy"
+                                  draggable="true"
+                                  onLoad={() => handleImageLoad(baseFilename || '')}
+                                  onDragStart={(ev) => handleDragStart(ev, index)}
+                                  onError={() => handleDelete(index)}
+                                  onClick={() =>
+                                    handleImageDoubleClick(
+                                      imageUrls[baseFilename || ''],
+                                      imageObj,
+                                      index
+                                    )
+                                  }
+                                  style={{
+                                    width: '100%',
+                                    height: '100%',
+                                    objectFit: 'cover',
+                                    borderRadius: '4px',
+                                    cursor: 'pointer',
+                                    boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
+                                    transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+                                    opacity: loadedImages[baseFilename || ''] ? 1 : 0,
+                                    position: 'absolute',
+                                    top: 0,
+                                    left: 0
+                                  }}
+                                />
+                              </div>
+                            )}
+                          </div>
+                        </Fade>
+                        <IconButton
+                          className="image-action-button"
+                          onClick={() => handleStarToggle(filename)}
+                          sx={{
+                            position: 'absolute',
+                            bottom: 0,
+                            left: 0,
+                            backgroundColor: 'rgba(0, 0, 0, 0.5)',
+                            color: isStarred ? 'primary.main' : 'white',
+                            width: 24,
+                            padding: '4px',
+                            opacity: isStarred ? 1 : 0,
+                            transform: isStarred ? 'scale(1)' : 'scale(0.8)',
+                            transition: 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)'
+                          }}
+                        >
+                          {isStarred ? (
+                            <StarIcon sx={{ fontSize: 16 }} />
+                          ) : (
+                            <StarBorderIcon />
+                          )}
+                        </IconButton>
+                        <IconButton
+                          className="image-action-button"
+                          onClick={() => handleDownload(imageUrls[baseFilename || ''], filename)}
+                          sx={{
+                            position: 'absolute',
+                            bottom: 0,
+                            right: 0,
+                            backgroundColor: 'rgba(0, 0, 0, 0.5)',
+                            color: 'white',
+                            width: 24,
+                            padding: '4px',
+                            opacity: 0,
+                            transform: 'scale(0.8)',
+                            transition: 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)'
+                          }}
+                        >
+                          <Tooltip title="Download (Ctrl+D)">
+                            <DownloadIcon sx={{ fontSize: 16 }} />
+                          </Tooltip>
+                        </IconButton>
+                        <IconButton
+                          className="image-action-button"
+                          onClick={() => handleDelete(index)}
+                          disabled={isDeletingImage === index}
                           sx={{
                             position: 'absolute',
                             top: 0,
-                            left: 0,
-                            bgcolor: 'rgba(255, 255, 255, 0.1)',
-                            borderRadius: '4px'
+                            right: 0,
+                            backgroundColor: 'rgba(0, 0, 0, 0.5)',
+                            color: 'white',
+                            width: 24,
+                            padding: '4px',
+                            opacity: 0,
+                            transform: 'scale(0.8)',
+                            visibility: isDeletingImage === index ? 'hidden' : 'visible'
                           }}
-                        />
-                      )}
-                      <Fade in={loadedImages[baseFilename || '']} timeout={500}>
-                        <img
-                          src={imageUrls[baseFilename || '']}
-                          alt={`Generated image ${index + 1}`}
-                          loading="lazy"
-                          draggable="true"
-                          onLoad={() => handleImageLoad(baseFilename || '')}
-                          onDragStart={(e) => handleDragStart(e, index)}
-                          onDoubleClick={() => handleImageDoubleClick(imageUrls[baseFilename || ''], imageObj)}
-                          style={{
-                            width: IMAGE_SIZES[imageSize],
-                            height: IMAGE_SIZES[imageSize],
-                            objectFit: 'cover',
-                            borderRadius: '4px',
-                            cursor: 'grab',
-                            boxShadow: '0 2px 4px rgba(0,0,0,0.1)',
-                            transition: 'box-shadow 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
-                            opacity: loadedImages[baseFilename || ''] ? 1 : 0
-                          }}
-                        />
-                      </Fade>
-                      <IconButton
-                        className="image-action-button"
-                        onClick={() => handleStarToggle(filename)}
-                        sx={{
-                          position: 'absolute',
-                          bottom: 0,
-                          left: 0,
-                          backgroundColor: 'rgba(0, 0, 0, 0.5)',
-                          color: isStarred ? 'primary.main' : 'white',
-                          width: 24,
-                          padding: '4px',
-                          opacity: isStarred ? 1 : 0,
-                          transform: isStarred ? 'scale(1)' : 'scale(0.8)',
-                          transition: 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
-                          '& .MuiTouchRipple-root': {
-                            display: 'none'
-                          }
-                        }}
-                      >
-                        {isStarred ? <StarIcon sx={{ fontSize: 16 }} /> : <StarBorderIcon sx={{ fontSize: 16 }} />}
-                      </IconButton>
-                      <IconButton
-                        className="image-action-button"
-                        onClick={() => handleDelete(index)}
-                        disabled={isDeletingImage === index}
-                        sx={{
-                          position: 'absolute',
-                          top: 0,
-                          right: 0,
-                          backgroundColor: 'rgba(0, 0, 0, 0.5)',
-                          color: 'white',
-                          width: 24,
-                          padding: '4px',
-                          opacity: 0,
-                          transform: 'scale(0.8)',
-                          transition: 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)',
-                          visibility: isDeletingImage === index ? 'hidden' : 'visible',
-                          '& .MuiTouchRipple-root': {
-                            display: 'none'
-                          }
-                        }}
-                      >
-                        <DeleteIcon sx={{ fontSize: 16 }} />
-                      </IconButton>
-                    </Box>
-                  )}
-                </ImageListItem>
-              );
-            }).filter(Boolean)}
+                        >
+                          <DeleteIcon sx={{ fontSize: 16 }} />
+                        </IconButton>
+                        {imageObj.prompt && (
+                          <Tooltip
+                            title={
+                              <Box sx={{ textAlign: 'center', maxWidth: 280, p: 1 }}>
+                                <Box sx={{ mb: 1, whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                                  {imageObj.prompt}
+                                </Box>
+                                <Tooltip title={thumbnailCopySuccess[filename] ? "Copied!" : "Copy Prompt"}>
+                                  <span>
+                                    <IconButton
+                                      size="small"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        navigator.clipboard.writeText(imageObj.prompt).then(() => {
+                                          console.log('Prompt copied!');
+                                          setThumbnailCopySuccess(prev => ({ ...prev, [filename]: true }));
+                                          setTimeout(() => {
+                                            setThumbnailCopySuccess(prev => ({ ...prev, [filename]: false }));
+                                          }, 1500);
+                                        }).catch(err => {
+                                          console.error('Failed to copy prompt:', err);
+                                        });
+                                      }}
+                                      sx={{
+                                        color: thumbnailCopySuccess[filename] ? '#4caf50' : 'white',
+                                        border: '1px solid rgba(255, 255, 255, 0.5)',
+                                        padding: '4px',
+                                        backgroundColor: 'rgba(0,0,0,0.2)',
+                                        '&:hover': {
+                                          borderColor: 'white',
+                                          bgcolor: 'rgba(255, 255, 255, 0.1)',
+                                        },
+                                      }}
+                                      disabled={thumbnailCopySuccess[filename]}
+                                    >
+                                      {thumbnailCopySuccess[filename] ? (
+                                        <CheckIcon sx={{ fontSize: 16 }} />
+                                      ) : (
+                                        <ContentCopyIcon sx={{ fontSize: 16 }} />
+                                      )}
+                                    </IconButton>
+                                  </span>
+                                </Tooltip>
+                              </Box>
+                            }
+                            placement="top"
+                            arrow
+                            componentsProps={{
+                              tooltip: {
+                                sx: {
+                                  textAlign: 'center',
+                                  '& .MuiTooltip-arrow': {
+                                    color: 'rgba(0, 0, 0, 0.9)'
+                                  }
+                                }
+                              }
+                            }}
+                            sx={{
+                              maxWidth: 300,
+                              fontSize: '14px',
+                              whiteSpace: 'pre-wrap',
+                              wordBreak: 'break-word',
+                              bgcolor: 'rgba(0, 0, 0, 0.9)'
+                            }}
+                          >
+                            <IconButton
+                              className="image-action-button"
+                              sx={{
+                                position: 'absolute',
+                                top: 0,
+                                left: 0,
+                                backgroundColor: 'rgba(0, 0, 0, 0.5)',
+                                color: 'white',
+                                width: 24,
+                                padding: '4px',
+                                opacity: 0,
+                                transform: 'scale(0.8)',
+                                transition: 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)'
+                              }}
+                            >
+                              <InfoIcon sx={{ fontSize: 16 }} />
+                            </IconButton>
+                          </Tooltip>
+                        )}
+                      </Box>
+                    )}
+                  </ImageListItem>
+                );
+              })
+              .filter(Boolean)}
           </ImageList>
-          {/* A small toggle in the corner to change image size */}
+
+          {/* Bottom-right toggle for image size */}
           <Box
             sx={{
               position: 'absolute',
@@ -1120,7 +1799,7 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
           </Box>
         </Box>
 
-        {/* Button to delete all non-starred images */}
+        {/* Delete all non-starred */}
         <Box
           sx={{
             display: 'flex',
@@ -1158,7 +1837,8 @@ const Gallery = ({ fieldKey, value, style, disabled, hidden, label, updateStore 
         >
           <DialogTitle>Delete All Non-Starred Images?</DialogTitle>
           <DialogContent>
-            This will permanently delete all images that are not starred. This action cannot be undone.
+            This will permanently delete all images that are not starred. This action cannot
+            be undone.
           </DialogContent>
           <DialogActions>
             <Button
