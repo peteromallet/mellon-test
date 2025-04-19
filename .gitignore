@@ -11,6 +11,7 @@ node_modules
 config.ini
 *.local
 __pycache__
+.env
 
 # Editor directories and files
 .vscode/*
